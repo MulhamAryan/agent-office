@@ -12,10 +12,13 @@
  */
 
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { URL } = require('url');
 
 const PORT = Number(process.env.PORT) || 4519;
 const HOST = process.env.HOST || '0.0.0.0';
+const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, 'office-state.json');
 
 // ─── State (in-memory) ───────────────────────────────────────────────────────
 
@@ -31,6 +34,30 @@ const IDLE_MS = 90 * 1000; // after this with no activity → "idle"
 const feed = []; // global recent events {ts, session, agent, kind, tool, ok, project}
 
 function now() { return Date.now(); }
+
+// ─── Persistance disque (survit au redémarrage) ──────────────────────────────
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try {
+      const data = JSON.stringify({ sessions: [...sessions.values()], feed });
+      fs.writeFile(STATE_FILE, data, () => {});
+    } catch { /* jamais bloquant */ }
+  }, 1500);
+}
+function loadState() {
+  try {
+    const raw = fs.readFileSync(STATE_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (data && Array.isArray(data.sessions)) {
+      for (const s of data.sessions) { if (s && s.id) sessions.set(s.id, s); }
+    }
+    if (data && Array.isArray(data.feed)) { feed.push(...data.feed); if (feed.length > MAX_FEED) feed.splice(0, feed.length - MAX_FEED); }
+    console.log(`état restauré : ${sessions.size} sessions`);
+  } catch { /* pas de fichier / illisible : on démarre à vide */ }
+}
 
 function projectOf(cwd) {
   if (!cwd) return 'unknown';
@@ -174,12 +201,14 @@ function handleEvent(ev) {
     case 'UserPromptSubmit':
       session.status = 'working';
       agent.status = 'working';
+      agent.waiting = false;
       if (detail) { session.lastPrompt = detail; agent.lastAction = detail; }
       break;
 
     case 'PreToolUse':
       session.status = 'working';
       agent.status = 'working';
+      agent.waiting = false;
       agent.currentTool = tool;
       if (detail) agent.lastAction = detail;
       break;
@@ -226,6 +255,12 @@ function handleEvent(ev) {
       for (const a of Object.values(session.agents)) { a.status = 'done'; a.currentTool = null; }
       break;
 
+    case 'Notification':
+      // Claude attend une action de l'utilisateur (permission, idle…)
+      agent.waiting = true;
+      agent.notice = detail || ev.message || 'attend une action';
+      break;
+
     default:
       break;
   }
@@ -243,14 +278,20 @@ function handleEvent(ev) {
   });
 
   broadcast();
+  scheduleSave();
 }
 
 // ─── Snapshot + SSE ──────────────────────────────────────────────────────────
 
 function refreshStatuses() {
   const t = now();
-  for (const s of sessions.values()) {
+  for (const [id, s] of sessions) {
     if (s.status === 'working' && t - s.lastActivity > IDLE_MS) s.status = 'idle';
+    // purge auto : session terminée depuis > 5 min, ou totalement inactive depuis > 30 min
+    if ((s.status === 'done' && s.endedAt && t - s.endedAt > 5 * 60 * 1000) ||
+        (t - s.lastActivity > 30 * 60 * 1000)) {
+      sessions.delete(id);
+    }
   }
 }
 
@@ -312,6 +353,16 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // POST /prune — supprime les sessions non actives (terminées / inactives)
+  if (req.method === 'POST' && url.pathname === '/prune') {
+    for (const [id, s] of sessions) { if (s.status !== 'working') sessions.delete(id); }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{}');
+    broadcast();
+    scheduleSave();
+    return;
+  }
+
   // GET /api/state — JSON snapshot (debug / intégrations)
   if (req.method === 'GET' && url.pathname === '/api/state') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -329,6 +380,8 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('not found');
 });
+
+loadState();   // restaure l'état précédent si présent
 
 server.listen(PORT, HOST, () => {
   const shown = HOST === '0.0.0.0' ? 'localhost' : HOST;
@@ -368,6 +421,36 @@ const HTML = /* html */ `<!DOCTYPE html>
     width:32px;height:30px;display:grid;place-items:center;font-size:14px;color:var(--dim)}
   header .sbtn:hover{border-color:#3a4c6b;color:#fff}
   header .sbtn.on{color:var(--green);border-color:#153d21}
+
+  /* mini-log d'activité (bas-gauche) */
+  #log{position:absolute;left:14px;bottom:12px;width:340px;max-width:calc(100% - 28px);z-index:6;
+    pointer-events:none;display:flex;flex-direction:column-reverse;gap:3px}
+  #log .lg{background:rgba(10,16,26,.72);border:1px solid rgba(38,52,76,.7);border-left:3px solid #2f4a6b;
+    border-radius:7px;padding:4px 9px;font-size:11px;color:var(--dim);white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis;animation:lgin .18s ease}
+  #log .lg .lt{color:#5c6b7e}
+  #log .lg .lp{color:#bcd4ff}
+  #log .lg .la{color:#e6edf3}
+  #log .lg.fail{border-left-color:#f85149}
+  #log .lg.done{border-left-color:#3fb950}
+  @keyframes lgin{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+  /* ── thème clair ── */
+  body.light{ --bg:#e9edf3; --line:#c6d0dd; --txt:#1b2431; --dim:#5a6b7e; }
+  body.light header{ background:rgba(233,237,243,.92); }
+  body.light header input#q{ background:#fff; color:#1b2431; border-color:#c6d0dd; }
+  body.light header input#q::placeholder{ color:#8a97a6; }
+  body.light header .sbtn{ background:#fff; border-color:#c6d0dd; color:#5a6b7e; }
+  body.light header .sbtn.on{ color:#1f9d4d; border-color:#a9dcbb; }
+  body.light #card{ background:linear-gradient(180deg,#ffffff,#eef2f7); border-color:#c6d0dd; }
+  body.light #card .cav{ background:#eef2f7; border-color:#c6d0dd; }
+  body.light #card .ct, body.light #card .row .val{ color:#1b2431; }
+  body.light #card .cx{ border-color:#c6d0dd; }
+  body.light #card .tm{ background:#f1f4f9; border-color:#d6dee9; }
+  body.light #card .tm .tn{ color:#6b3fd0; }
+  body.light #log .lg{ background:rgba(255,255,255,.85); border-color:rgba(180,195,215,.8); border-left-color:#8aa0bd; color:#5a6b7e; }
+  body.light #log .lg .la{ color:#1b2431; } body.light #log .lg .lp{ color:#2f5bd0; }
+  body.light #empty{ color:#5a6b7e; }
   #stage{position:absolute;inset:52px 0 0 0}
   canvas{display:block;width:100%;height:100%}
   #empty{position:absolute;inset:52px 0 0 0;display:none;align-items:center;justify-content:center;
@@ -375,6 +458,40 @@ const HTML = /* html */ `<!DOCTYPE html>
   #empty code{color:#4c9aff;background:#121a26;padding:2px 6px;border-radius:4px}
   canvas{cursor:default}
   canvas.hot{cursor:pointer}
+
+  /* historique d'outils (pulse-lane) dans le panneau détail */
+  #card .cticks{display:flex;gap:2px;flex-wrap:wrap;align-items:center}
+  #card .ctk{width:5px;height:13px;border-radius:1px;background:#4c9aff;opacity:.9}
+  #card .ctk.bad{background:#f85149}
+
+  /* panneau Équipe (vue d'ensemble agents + sous-agents) */
+  #team{position:absolute;top:66px;left:14px;width:300px;max-width:calc(100% - 28px);
+    z-index:7;background:linear-gradient(180deg,#141b28,#0e131c);border:1px solid #26344c;
+    border-radius:12px;box-shadow:0 14px 40px rgba(0,0,0,.5);display:none;overflow:hidden}
+  #teamBody{max-height:calc(100vh - 230px);overflow:auto}
+  #team.open{display:block}
+  #teamHead{font-size:11px;padding:10px 12px;border-bottom:1px solid #1e2735;color:var(--dim);
+    text-transform:uppercase;letter-spacing:1px;display:flex;align-items:center;gap:8px;cursor:move;user-select:none}
+  #teamHead .tot{margin-left:auto;color:var(--txt);font-size:11px;letter-spacing:0;text-transform:none}
+  #teamHead #teamCol{cursor:pointer;color:var(--dim);font-size:13px;padding:0 2px;transition:transform .15s}
+  #teamHead #teamCol:hover{color:var(--txt)}
+  #team.collapsed #teamBody{display:none}
+  #team.collapsed #teamCol{transform:rotate(-90deg)}
+  #team .tbody{padding:6px}
+  #team .ts{border:1px solid #1a2434;border-radius:9px;margin:5px;padding:8px 10px;background:#0d131d}
+  #team .ts .th{display:flex;align-items:center;gap:7px;font-size:12px}
+  #team .ts .dot{width:8px;height:8px;border-radius:50%;flex:none}
+  #team .ts .pn{font-weight:600;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #team .ts .stt{margin-left:auto;font-size:9px;text-transform:uppercase;letter-spacing:.5px;flex:none}
+  #team .ts .stt.working{color:var(--amber)} #team .ts .stt.idle{color:var(--dim)} #team .ts .stt.done{color:var(--green)}
+  #team .ts .ac{font-size:11px;color:var(--dim);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:"Consolas",monospace}
+  #team .sub{display:flex;align-items:center;gap:6px;font-size:11px;color:#c9b6f0;padding:3px 0 0 10px}
+  #team .sub .sa{color:var(--dim);margin-left:auto;font-size:10px;font-family:"Consolas",monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:120px}
+  #team .row2{cursor:pointer}
+  #team .row2:hover .pn{color:#9cc3ff}
+  body.light #team{background:linear-gradient(180deg,#fff,#eef2f7);border-color:#c6d0dd}
+  body.light #team .ts{background:#f1f4f9;border-color:#d6dee9}
+  body.light #team .ts .pn{color:#1b2431}
 
   /* panneau de détail (clic sur un agent) */
   #card{position:absolute;top:66px;right:16px;width:320px;max-width:calc(100% - 32px);
@@ -419,12 +536,22 @@ const HTML = /* html */ `<!DOCTYPE html>
     <span><b id="s-tools">0</b> actions</span>
   </div>
   <div class="tools2">
-    <input id="q" type="text" placeholder="🔍 filtrer un projet…" autocomplete="off">
-    <span class="sbtn" id="snd" title="Sons (clic pour activer)">🔇</span>
+    <input id="q" type="text" placeholder="🔍 filtrer (projet, outil, action…)" autocomplete="off">
+    <span class="sbtn on" id="teamBtn" title="Panneau Équipe">👥</span>
+    <span class="sbtn" id="prune" title="Nettoyer les sessions inactives">🧹</span>
+    <span class="sbtn" id="rep" title="Exporter un rapport Markdown">📄</span>
+    <span class="sbtn" id="theme" title="Thème clair / sombre">🌓</span>
+    <span class="sbtn" id="day" title="Jour / nuit">🌗</span>
+    <span class="sbtn on" id="snd" title="Sons (fin d'agent + erreurs)">🔊</span>
   </div>
 </header>
 <div id="stage"><canvas id="cv"></canvas></div>
 <div id="empty">Bureau vide.<br><br>Branche tes hooks Claude Code vers <code>POST http://localhost:4519/event</code> puis lance une session.</div>
+<div id="team" class="open">
+  <div id="teamHead"><span>👥 Équipe</span><span id="teamTot" class="tot"></span><span id="teamCol" title="Replier">▾</span></div>
+  <div id="teamBody"></div>
+</div>
+<div id="log"></div>
 <div id="card"></div>
 
 <script>
@@ -443,6 +570,7 @@ var TILE = 32, OX = 0, OY = 0, DPR = 1, STW = 0, STH = 0;
 var WALL = {}, BLOCK = {}, CHAIRS = {};
 var desks = [], decos = [], walkCells = [];
 var AMENITIES = [], BED = null;   // coins détente (café/sport/canapé/eau) + lit
+var MEETING = null;               // salle de réunion (workflows multi-agents)
 function key(c, r){ return c + ',' + r; }
 
 function buildLayout(){
@@ -481,9 +609,49 @@ function buildLayout(){
   ];
   BED = { type:'bed', emoji:'💤', spot:{c:21, r:11} };
 
+  // salle de réunion (bas-gauche) : table + 6 sièges autour
+  decos.push({ t:'table', c:8,  r:11 });
+  decos.push({ t:'table', c:9,  r:11 });
+  BLOCK[key(8,11)] = 1; BLOCK[key(9,11)] = 1;
+  MEETING = { seats:[ {c:7,r:11},{c:10,r:11},{c:8,r:10},{c:9,r:10},{c:8,r:12},{c:9,r:12} ] };
+
+  // positions de bureaux personnalisées (éditeur, persistées)
+  var saved = loadDesks();
+  if(saved && saved.length === desks.length){
+    for(var si=0; si<desks.length; si++){
+      delete BLOCK[key(desks[si].c, desks[si].r)];
+      delete CHAIRS[key(desks[si].chair.c, desks[si].chair.r)];
+      desks[si].c = saved[si].c; desks[si].r = saved[si].r;
+      desks[si].chair = { c:saved[si].c, r:saved[si].r+1 };
+      BLOCK[key(desks[si].c, desks[si].r)] = 1;
+      CHAIRS[key(desks[si].chair.c, desks[si].chair.r)] = 1;
+    }
+  }
+
   for(c=1;c<GW-1;c++) for(r=1;r<GH-1;r++){
     if(!WALL[key(c,r)] && !BLOCK[key(c,r)] && !CHAIRS[key(c,r)]) walkCells.push({c:c,r:r});
   }
+}
+function loadDesks(){ try{ return JSON.parse(localStorage.getItem('agentOfficeDesks')||'null'); }catch(e){ return null; } }
+function saveDesks(){ try{ localStorage.setItem('agentOfficeDesks', JSON.stringify(desks.map(function(d){ return {c:d.c,r:d.r}; }))); }catch(e){} }
+function cellAt(mx,my){ return { c:Math.floor((mx-OX)/TILE), r:Math.floor((my-OY)/TILE) }; }
+function deskAt(mx,my){ var p = cellAt(mx,my); for(var i=0;i<desks.length;i++) if(desks[i].c===p.c && desks[i].r===p.r) return i; return -1; }
+function deskFree(c,r,except){
+  if(c<1 || r<1 || c>=GW-1 || r>=GH-2) return false;               // garder la place de la chaise (r+1)
+  if(WALL[key(c,r)] || WALL[key(c,r+1)]) return false;
+  for(var i=0;i<desks.length;i++){ if(i===except) continue;
+    if(desks[i].c===c && desks[i].r===r) return false;
+    if(desks[i].chair.c===c && desks[i].chair.r===r) return false; }
+  for(var d=0;d<decos.length;d++){ if(decos[d].c===c && decos[d].r===r) return false; }
+  return true;
+}
+function moveDesk(idx,c,r){
+  var d = desks[idx];
+  delete BLOCK[key(d.c,d.r)]; delete CHAIRS[key(d.chair.c,d.chair.r)];
+  d.c = c; d.r = r; d.chair = { c:c, r:r+1 };
+  BLOCK[key(c,r)] = 1; CHAIRS[key(c,r+1)] = 1;
+  saveDesks();
+  if(lastData) applyState(lastData);   // rafraîchit aussitôt le poste des agents concernés
 }
 function pickAmenity(k){
   var h = 0; for(var i=0;i<k.length;i++) h = (h*31 + k.charCodeAt(i)) >>> 0;
@@ -558,11 +726,26 @@ function poseFor(tool){
   return 'typing';
 }
 
+// rôle d'un sous-agent → icône + couleur (reconnaissance immédiate)
+function roleInfo(type){
+  var t = String(type||'').toLowerCase();
+  if(t.indexOf('explore')>=0)  return { icon:'🔭', pal:{sk:'#e8b58f',ha:'#233a5c',sh:'#4c9aff'} };
+  if(t.indexOf('plan')>=0)     return { icon:'🗺️', pal:{sk:'#f0c8a0',ha:'#3a2452',sh:'#a371f7'} };
+  if(t.indexOf('review')>=0)   return { icon:'🔍', pal:{sk:'#d89a6a',ha:'#4a3316',sh:'#ffb020'} };
+  if(t.indexOf('security')>=0) return { icon:'🛡️', pal:{sk:'#c88a5a',ha:'#20242c',sh:'#f85149'} };
+  if(t.indexOf('test')>=0)     return { icon:'🧪', pal:{sk:'#f2d0b0',ha:'#1e4a30',sh:'#3fb950'} };
+  if(t.indexOf('doc')>=0)      return { icon:'📚', pal:{sk:'#e8c0a0',ha:'#5a3a20',sh:'#e0803a'} };
+  if(t.indexOf('debug')>=0||t.indexOf('fix')>=0) return { icon:'🐛', pal:{sk:'#d8a878',ha:'#333',sh:'#e05a7a'} };
+  if(t.indexOf('general')>=0)  return { icon:'🤖', pal:{sk:'#e8c0a0',ha:'#2a2a2a',sh:'#22b8c0'} };
+  return { icon:'🤝', pal:palOf(type||'agent') };
+}
+
 // ── entités (un worker par agent) ─────────────────────────────────────────────
 var workers = {};   // key -> worker
 var deskFor = {};   // sessionId -> deskIndex
 var nextDesk = 0;
 var retired = {};              // sessions terminées déjà parties (ne pas recréer)
+var meetingName = '';          // nom du projet actuellement en salle de réunion
 var REST_SECONDS = 18;         // temps de sommeil avant de quitter le bureau
 function clockNow(){ return performance.now()*0.001; }
 function durShort(ms){
@@ -573,17 +756,70 @@ function durShort(ms){
 
 // ── filtre projet ─────────────────────────────────────────────────────────────
 var filter = '';
-function matchFilter(w){ return !filter || (w.name||'').toLowerCase().indexOf(filter) >= 0; }
+function matchFilter(w){
+  if(!filter) return true;
+  var hay = ((w.name||'') + ' ' + (w.type||'') + ' ' + (w.tool||'') + ' ' + (w.action||'')).toLowerCase();
+  return hay.indexOf(filter) >= 0;
+}
+
+// ── thème clair / sombre (palette du canvas) ──────────────────────────────────
+var themeLight = false;
+function TH(){
+  return themeLight
+    ? { floorA:'#dde6f1', floorB:'#e8eef6', wall:'#b7c4d5', wallHi:'#cdd8e6', wallLo:'#9fafc2', mat:'#d3c6ea' }
+    : { floorA:'#1b2a3c', floorB:'#1f3044', wall:'#2b3a4d', wallHi:'#374a61', wallLo:'#1f2a38', mat:'#3a2f4a' };
+}
+
+// ── jour / nuit ───────────────────────────────────────────────────────────────
+var nightState = 'auto';  // 'auto' | 'day' | 'night'
+function isNight(){
+  if(nightState==='night') return true;
+  if(nightState==='day') return false;
+  var h = new Date().getHours();
+  return h < 7 || h >= 19;
+}
+function drawNight(t){
+  if(!isNight()) return;
+  ctx.save();
+  ctx.fillStyle = 'rgba(10,14,45,.5)';           // voile bleu nuit
+  ctx.fillRect(0, 0, STW, STH);
+  ctx.globalCompositeOperation = 'lighter';       // halos de lampes de bureau
+  for(var wk in workers){
+    var w = workers[wk];
+    if(!(w.isMain && w.mode==='work' && w.deskChair)) continue;
+    var lx = OX + (w.deskChair.c+0.5)*TILE, ly = OY + (w.deskChair.r-0.5)*TILE;
+    var g = ctx.createRadialGradient(lx, ly, 2, lx, ly, TILE*1.6);
+    g.addColorStop(0, 'rgba(255,200,120,.5)');
+    g.addColorStop(1, 'rgba(255,200,120,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(lx, ly, TILE*1.6, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
 
 // ── sons (mutables, off par défaut) ───────────────────────────────────────────
-var soundOn = false, actx = null, lastSoundTs = 0;
-function beep(freq, dur, vol){
+var soundOn = true, actx = null, lastSoundTs = 0;  // ON par défaut
+function ensureAudio(){
+  if(!actx){ try{ actx = new (window.AudioContext || window.webkitAudioContext)(); }catch(e){} }
+  if(actx && actx.state === 'suspended') actx.resume();
+}
+function beep(type, freq, dur, vol, delay){
   if(!actx) return;
+  var t0 = actx.currentTime + (delay || 0);
   var o = actx.createOscillator(), g = actx.createGain();
-  o.type = 'sine'; o.frequency.value = freq; g.gain.value = vol;
+  o.type = type; o.frequency.value = freq;
   o.connect(g); g.connect(actx.destination);
-  o.start(); g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
-  o.stop(actx.currentTime + dur);
+  g.gain.setValueAtTime(vol, t0);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.start(t0); o.stop(t0 + dur);
+}
+function chimeDone(){   // carillon doux ascendant : "l'agent a terminé"
+  beep('sine', 523, 0.12, 0.06, 0);       // C5
+  beep('sine', 784, 0.20, 0.06, 0.11);    // G5
+}
+function buzzError(){   // buzz grave distinct : erreur
+  beep('square', 160, 0.28, 0.06, 0);
+  beep('square', 120, 0.30, 0.05, 0.06);
 }
 function playSounds(state){
   var f = state.feed || [];
@@ -591,8 +827,9 @@ function playSounds(state){
     for(var i=f.length-1; i>=0; i--){          // feed = plus récent en tête → on parcourt du plus ancien au plus récent
       var e = f[i];
       if(e.ts <= lastSoundTs) continue;
-      if(e.kind==='PostToolUseFailure') beep(200, 0.2, 0.09);
-      else if(e.kind==='PostToolUse') beep(680, 0.05, 0.035);
+      // UNIQUEMENT : fin d'agent (carillon) et erreur (buzz). Rien sur les actions/communication.
+      if(e.kind==='PostToolUseFailure') buzzError();
+      else if(e.kind==='Stop' || e.kind==='SessionEnd') chimeDone();
     }
   }
   if(f.length) lastSoundTs = Math.max(lastSoundTs, f[0].ts);
@@ -621,8 +858,10 @@ function makeWorker(k, pal, name, isMain){
     fc:dr.c, fr:dr.r, cell:{c:dr.c, r:dr.r},
     path:[], mode:'work', home:{c:dr.c,r:dr.r},
     tool:null, action:'', task:'', sessStatus:'working', agentStatus:'working',
-    facing:'up', moving:false, pose:'walk', amenity:null,
+    facing:'up', moving:false, pose:'walk', amenity:null, deskChair:null,
     errSeen:0, errUntil:0, errTool:'', actions:0, startedAt:0, restSince:null,
+    energy:100, teleUntil:0, waiting:false, roleIcon:'🤝', stale:false, ticks:[],
+    rainUntil:performance.now()*0.001 + 1.4,   // pluie "Matrix" à l'arrivée
     spawn:performance.now()*0.001, dead:false
   };
 }
@@ -633,6 +872,71 @@ function noteErr(w, ag){
     w.errSeen = ag.lastErrorAt;
     w.errUntil = performance.now()*0.001 + 3.5;
     w.errTool = ag.lastErrorTool || '';
+  }
+}
+
+// ── mini-log d'activité (bas-gauche) ──────────────────────────────────────────
+var logEl = document.getElementById('log');
+var _logHtml = '';
+function fmtT(ts){ var d = new Date(ts); function p(n){ return (n<10?'0':'')+n; } return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds()); }
+function updateLog(state){
+  var f = state.feed || [], items = [];
+  // si un agent est sélectionné → on filtre le log sur SA session
+  var selSid = (typeof selectedKey!=='undefined' && selectedKey && workers[selectedKey]) ? workers[selectedKey].sid : null;
+  for(var i=0; i<f.length && items.length<8; i++){
+    var e = f[i];
+    if(e.kind==='PreToolUse') continue;   // on garde le Post (évite les doublons)
+    if(selSid && e.session !== selSid) continue;
+    var cls = e.kind==='PostToolUseFailure' ? 'fail'
+            : ((e.kind==='Stop'||e.kind==='SessionEnd'||e.kind==='SubagentStop') ? 'done' : '');
+    var what = e.detail || e.kind;
+    items.push('<div class="lg '+cls+'"><span class="lt">'+fmtT(e.ts)+'</span> '
+      + '<span class="lp">'+esc(e.project||'')+'</span> <span class="la">'+esc(what)+'</span></div>');
+  }
+  var html = items.join('');
+  if(html !== _logHtml){ _logHtml = html; logEl.innerHTML = html; }
+}
+
+// ── panneau Équipe : vue d'ensemble sessions → agents → sous-agents ───────────
+var teamEl = document.getElementById('team');
+var teamBodyEl = document.getElementById('teamBody');
+var teamTotEl = document.getElementById('teamTot');
+var _teamHtml = '';
+function updateTeam(state){
+  var S = (state.sessions || []).slice().sort(function(a,b){ return a.startedAt - b.startedAt; });
+  var rows = '', totAgents = 0;
+  for(var i=0;i<S.length;i++){
+    var s = S[i], col = palOf(s.project||s.id).sh, main = s.agents && s.agents.main;
+    var act = (main && main.currentTool) ? (toolIcon(main.currentTool)+' '+main.currentTool+(main.lastAction?' — '+main.lastAction:''))
+            : (main && main.lastAction ? main.lastAction : (s.lastPrompt||'…'));
+    var subs = '', subCount = 0, ags = s.agents || {};
+    for(var aid in ags){ if(aid==='main') continue; var a = ags[aid]; if(a.status==='done') continue; subCount++;
+      var ri = roleInfo(a.type), life = a.startedAt ? durShort(Date.now()-a.startedAt) : '';
+      var sact = a.currentTool ? (toolIcon(a.currentTool)+' '+a.currentTool) : (a.lastAction||'en renfort');
+      subs += '<div class="sub">'+ri.icon+' '+esc(a.type||'agent')+'<span class="sa">'+esc(sact)+' · '+life+'</span></div>';
+    }
+    totAgents += 1 + subCount;
+    rows += '<div class="ts"><div class="th row2" data-sid="'+esc(s.id)+'">'
+      + '<span class="dot" style="background:'+col+'"></span>'
+      + '<span class="pn">'+esc(s.project||'session')+'</span>'
+      + (subCount?'<span style="color:#8b98a9;font-size:10px">+'+subCount+'</span>':'')
+      + '<span class="stt '+s.status+'">'+esc(s.status)+'</span></div>'
+      + '<div class="ac">'+esc(act)+'</div>' + subs + '</div>';
+  }
+  if(!rows) rows = '<div style="padding:14px;color:#5c6b7e;font-size:12px">Aucune session.</div>';
+  var html = '<div class="tbody">'+rows+'</div>';
+  if(html !== _teamHtml){ _teamHtml = html; teamBodyEl.innerHTML = html; }
+  teamTotEl.textContent = S.length + ' sess · ' + totAgents + ' agents';
+}
+
+// ── notifications navigateur (agent en attente) ───────────────────────────────
+var notifiedWait = {};
+function notify(msg){ try{ if(window.Notification && Notification.permission==='granted') new Notification('agent-office', { body: msg }); }catch(e){} }
+function checkNotifs(){
+  for(var wk in workers){
+    var w = workers[wk];
+    if(w.waiting){ if(!notifiedWait[wk]){ notifiedWait[wk] = 1; notify(w.name + ' attend une action'); } }
+    else notifiedWait[wk] = 0;
   }
 }
 
@@ -658,10 +962,20 @@ function applyState(state){
   var ordered = S.slice().sort(function(a,b){ return a.startedAt - b.startedAt; });
   var desired = {};
 
+  // salle de réunion : la session avec le plus de sous-agents actifs (≥2) s'y installe
+  var meetingSid = null, maxSubs = 1;
+  meetingName = '';
+  for(var mI=0; mI<ordered.length; mI++){
+    var ms = ordered[mI], cnt = 0, mags = ms.agents || {};
+    for(var ma in mags){ if(ma!=='main' && mags[ma].status!=='done') cnt++; }
+    if(cnt > maxSubs){ maxSubs = cnt; meetingSid = ms.id; meetingName = ms.project || 'session'; }
+  }
+
   for(var s=0;s<ordered.length;s++){
     var sess = ordered[s];
     var di = deskIndexFor(sess.id);
     var main = (sess.agents && sess.agents.main) ? sess.agents.main : null;
+    var inMeeting = (sess.id === meetingSid);
 
     // total d'actions de la session (tous agents confondus)
     var sessActions = 0, ags0 = sess.agents || {};
@@ -682,8 +996,12 @@ function applyState(state){
       w.agentStatus = main ? main.status : sess.status;
       w.actions = sessActions;
       w.startedAt = sess.startedAt || 0;
+      w.waiting = main ? !!main.waiting : false;
+      w.ticks = main ? (main.ticks || []) : [];
+      w.stale = (sess.status==='working' && (state.now - (sess.lastActivity||0)) > 45000);
       if(main) noteErr(w, main);
-      w.home = desks[di].chair;
+      w.deskChair = desks[di].chair;
+      w.home = (inMeeting && sess.status==='working') ? MEETING.seats[0] : desks[di].chair;
       if(sess.status==='working'){ w.mode = 'work'; w.restSince = null; delete retired[sess.id]; }
       else if(sess.status==='idle'){ w.mode = 'relax'; w.restSince = null; delete retired[sess.id]; }
       else { // terminé : dort au lit un moment puis quitte le bureau
@@ -702,8 +1020,10 @@ function applyState(state){
       if(a.status === 'done') continue;         // terminé → quitte le bureau
       var sk = sess.id + ':' + aid;
       desired[sk] = 1;
+      var ri = roleInfo(a.type);
       var sw = workers[sk];
-      if(!sw){ sw = workers[sk] = makeWorker(sk, palOf(aid), a.type||'agent', false); }
+      if(!sw){ sw = workers[sk] = makeWorker(sk, ri.pal, a.type||'agent', false); }
+      sw.pal = ri.pal; sw.roleIcon = ri.icon;
       sw.name = a.type || 'agent';
       sw.type = a.type || '';
       sw.tool = a.currentTool;
@@ -713,8 +1033,10 @@ function applyState(state){
       sw.agentStatus = a.status;
       sw.actions = a.actions || 0;
       sw.startedAt = a.startedAt || sess.startedAt || 0;
+      sw.waiting = !!a.waiting;
+      sw.ticks = a.ticks || [];
       noteErr(sw, a);
-      sw.home = subSpot(di, subIdx);
+      sw.home = inMeeting ? (MEETING.seats[(subIdx+1) % MEETING.seats.length]) : subSpot(di, subIdx);
       sw.mode = 'work';
       subIdx++;
     }
@@ -723,6 +1045,9 @@ function applyState(state){
   // workers dont la session/agent a disparu → ils partent
   for(var wk in workers){ if(!desired[wk]) workers[wk].mode = 'leave'; }
 
+  updateLog(state);    // mini-log d'activité
+  updateTeam(state);   // panneau Équipe
+  checkNotifs();       // notifications navigateur
   playSounds(state);   // sons sur nouveaux events (si activés)
 }
 
@@ -747,40 +1072,30 @@ function update(dt, t){
     }
     else { w.amenity = null; goal = w.home; }
 
-    // (re)calcul du chemin si besoin
-    var pend = w.path.length ? w.path[w.path.length-1] : null;
-    if(!eq(w.cell, goal) && (!pend || !eq(pend, goal))){
-      w.path = bfs(w.cell, goal);
-    }
-
-    // suivi du chemin
+    // téléportation : au lieu de marcher, l'agent se rematérialise directement
     w.moving = false;
-    if(w.path.length){
-      var nx = w.path[0];
-      var tx = nx.c, ty = nx.r;
-      var dx = tx - w.fc, dy = ty - w.fr;
-      var dist = Math.sqrt(dx*dx + dy*dy);
-      var step = SPEED * dt;
-      if(dist <= step || dist < 0.001){
-        w.fc = tx; w.fr = ty; w.cell = {c:tx, r:ty}; w.path.shift();
-      } else {
-        w.fc += dx/dist * step; w.fr += dy/dist * step;
-        w.facing = Math.abs(dx) > Math.abs(dy) ? (dx>0?'right':'left') : (dy>0?'down':'up');
-      }
-      w.moving = true;
+    if(w.mode==='leave'){ w.dead = true; continue; }   // il se dématérialise et part
+    if(!eq(w.cell, goal)){
+      w.fc = goal.c; w.fr = goal.r; w.cell = {c:goal.c, r:goal.r};
+      w.spawn = t;              // rejoue l'anim d'apparition (scale-in)
+      w.teleUntil = t + 0.5;    // effet de téléportation
     }
 
-    // arrivée à la porte en mode "leave" → suppression
-    if(w.mode==='leave' && eq(w.cell, door()) && !w.path.length){ w.dead = true; }
-
-    // pose
-    if(w.moving) w.pose = 'walk';
-    else if(w.mode==='work') w.pose = w.tool ? poseFor(w.tool) : 'think';
+    // pose (plus de marche)
+    if(w.mode==='work') w.pose = w.tool ? poseFor(w.tool) : 'think';
     else if(w.mode==='rest') w.pose = 'bed';
     else if(w.mode==='relax') w.pose = w.amenity ? w.amenity.type : 'idle';
     else w.pose = 'idle';
 
-    w.sitting = (w.mode==='work') && !w.moving && eq(w.cell, w.home) && w.isMain;
+    w.sitting = (w.mode==='work') && eq(w.cell, w.home) && w.isMain;
+
+    // énergie : baisse quand il bosse dur, remonte au repos / café
+    var drain = (w.mode==='work' && w.tool) ? 5.5 : 0;
+    var gain = 0;
+    if(w.mode==='rest') gain = 16;
+    else if(w.mode==='relax') gain = (w.amenity && w.amenity.type==='coffee') ? 22 : 11;
+    else if(w.mode==='work' && !w.tool) gain = 2.5;    // réflexion = petite récup
+    w.energy = Math.max(0, Math.min(100, w.energy - drain*dt + gain*dt));
   }
   for(var dk in workers){ if(workers[dk].dead) delete workers[dk]; }
 }
@@ -792,20 +1107,21 @@ function rr(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,
   ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
 
 function drawFloor(){
+  var th = TH();
   for(var c=0;c<GW;c++) for(var r=0;r<GH;r++){
     var x = OX + c*TILE, y = OY + r*TILE;
     if(WALL[key(c,r)]){
-      ctx.fillStyle = '#2b3a4d'; ctx.fillRect(x,y,TILE,TILE);
-      ctx.fillStyle = '#374a61'; ctx.fillRect(x,y,TILE,3);
-      ctx.fillStyle = '#1f2a38'; ctx.fillRect(x,y+TILE-3,TILE,3);
+      ctx.fillStyle = th.wall; ctx.fillRect(x,y,TILE,TILE);
+      ctx.fillStyle = th.wallHi; ctx.fillRect(x,y,TILE,3);
+      ctx.fillStyle = th.wallLo; ctx.fillRect(x,y+TILE-3,TILE,3);
     } else {
-      ctx.fillStyle = ((c+r)%2===0) ? '#1b2a3c' : '#1f3044';
+      ctx.fillStyle = ((c+r)%2===0) ? th.floorA : th.floorB;
       ctx.fillRect(x,y,TILE,TILE);
     }
   }
   // tapis d'entrée
   var d = door();
-  ctx.fillStyle = '#3a2f4a';
+  ctx.fillStyle = th.mat;
   ctx.fillRect(OX+(d.c-0.5)*TILE, OY+(d.r-1)*TILE, TILE*2, TILE);
 }
 
@@ -826,7 +1142,7 @@ function deskActive(dk){
   // écran allumé si un worker de ce bureau bosse
   for(var wk in workers){
     var w = workers[wk];
-    if(w.isMain && w.home && w.home.c===dk.chair.c && w.home.r===dk.chair.r && w.mode==='work') return true;
+    if(w.isMain && w.deskChair && w.deskChair.c===dk.chair.c && w.deskChair.r===dk.chair.r && w.mode==='work') return true;
   }
   return false;
 }
@@ -859,13 +1175,52 @@ function drawDeco(dc){
   } else if(dc.t==='couch'){
     ctx.fillStyle='#3a4b63'; rr(x+TILE*0.12,y+TILE*0.35,TILE*0.76,TILE*0.5,5); ctx.fill();
     ctx.fillStyle='#46597a'; ctx.fillRect(x+TILE*0.12,y+TILE*0.3,TILE*0.76,TILE*0.15);
+  } else if(dc.t==='table'){
+    ctx.fillStyle='#5a4630'; ctx.fillRect(x, y+TILE*0.28, TILE, TILE*0.5);
+    ctx.fillStyle='#6e5738'; ctx.fillRect(x, y+TILE*0.28, TILE, 4);
   }
 }
 
+var RAIN_CH = '01ｱｳｴｶｷｸｹﾊﾋﾌ$#%&@';
 function drawWorker(w, t){
   var x = px(w.fc), y = py(w.fr);
   var scale = Math.min(1, (t - w.spawn) / 0.4); // petite anim d'apparition
   var s = TILE * 0.5 * scale;
+
+  // ── pluie "Matrix" à l'arrivée d'un nouvel agent ──
+  if(t < w.rainUntil){
+    var a2 = Math.min(1, (w.rainUntil - t) / 0.5);
+    ctx.save();
+    ctx.font = Math.round(TILE*0.24) + 'px "Consolas",monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    for(var col=-1; col<=1; col++){
+      for(var d=0; d<5; d++){
+        var yy = y - TILE*0.9 + (((t*90 + d*22 + (col+2)*13) % (TILE*1.7)));
+        var ci = (Math.floor(t*12) + d*3 + col*5) % RAIN_CH.length;
+        ctx.fillStyle = (d===0) ? 'rgba(180,255,200,' + a2 + ')' : 'rgba(60,220,120,' + (a2*0.8) + ')';
+        ctx.fillText(RAIN_CH.charAt(ci), x + col*TILE*0.24, yy);
+      }
+    }
+    ctx.restore();
+  }
+
+  // ── effet de téléportation (rayon + anneau qui s'élargit) ──
+  if(t < w.teleUntil){
+    var p = 1 - (w.teleUntil - t) / 0.5;          // 0 → 1
+    var a = 1 - p;                                 // fondu
+    ctx.save();
+    ctx.globalAlpha = a * 0.8;
+    var grd = ctx.createLinearGradient(x, y - TILE*0.9, x, y + TILE*0.5);
+    grd.addColorStop(0, 'rgba(90,220,255,0)');
+    grd.addColorStop(0.5, 'rgba(90,220,255,.9)');
+    grd.addColorStop(1, 'rgba(90,220,255,0)');
+    ctx.fillStyle = grd;
+    ctx.fillRect(x - TILE*0.16, y - TILE*0.9, TILE*0.32, TILE*1.4);
+    ctx.globalAlpha = a;
+    ctx.strokeStyle = '#8fe8ff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.ellipse(x, y + TILE*0.12, TILE*0.2 + p*TILE*0.5, TILE*0.08 + p*TILE*0.2, 0, 0, 7); ctx.stroke();
+    ctx.restore();
+  }
 
   // ── pose couchée (dort au lit) ─────────────────────────────
   if(w.pose==='bed'){
@@ -939,6 +1294,13 @@ function drawWorker(w, t){
   // cheveux
   ctx.fillStyle = w.pal.ha;
   ctx.beginPath(); ctx.arc(x, cy - s*0.36, s*0.26, Math.PI*1.05, Math.PI*1.95); ctx.fill();
+
+  // barre d'énergie au-dessus de la tête
+  var e = w.energy == null ? 100 : w.energy;
+  var bw = s*0.8, bx = x - bw/2, byy = cy - s*0.78;
+  ctx.fillStyle = 'rgba(8,12,20,.6)'; rr(bx, byy, bw, 3.5, 2); ctx.fill();
+  ctx.fillStyle = e>50 ? '#3fb950' : (e>25 ? '#ffb020' : '#f85149');
+  rr(bx, byy, bw * (e/100), 3.5, 2); ctx.fill();
 }
 
 function drawTag(w){
@@ -1041,9 +1403,9 @@ function drawCollab(t){
 
 // plaque de poste : nom du projet fixé au bureau (permanent, une seule fois)
 function drawDeskPlate(w){
-  if(!w.isMain || !w.home) return;
-  var cx = OX + (w.home.c + 0.5)*TILE;
-  var deskTop = OY + (w.home.r - 1)*TILE;
+  if(!w.isMain || !w.deskChair) return;
+  var cx = OX + (w.deskChair.c + 0.5)*TILE;
+  var deskTop = OY + (w.deskChair.r - 1)*TILE;
   var y = deskTop - 17;
   ctx.font = '600 10px "Segoe UI",system-ui,sans-serif';
   var label = fit(w.name, TILE*1.7);
@@ -1062,13 +1424,41 @@ function drawDeskPlate(w){
   }
 }
 
+// plaque sur la table de réunion : nom du projet en réunion
+function drawMeetingLabel(){
+  if(!meetingName || !MEETING) return;
+  var cx = OX + 9*TILE;                 // centre de la table (cases 8 et 9, r=11)
+  var y  = OY + 11*TILE - 6;
+  ctx.font = '600 11px "Segoe UI",system-ui,sans-serif';
+  var label = '🪑 ' + meetingName + ' — réunion';
+  var tw = ctx.measureText(label).width + 14;
+  ctx.fillStyle = '#160f26';
+  rr(cx - tw/2, y - 15, tw, 17, 5); ctx.fill();
+  ctx.strokeStyle = '#a371f7'; ctx.lineWidth = 1; rr(cx - tw/2, y - 15, tw, 17, 5); ctx.stroke();
+  ctx.fillStyle = '#c9b6f0'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(label, cx, y - 6);
+}
+
+// label de type permanent sous un sous-agent (Explore, Plan…)
+function drawSubLabel(w){
+  if(w.isMain || !w.type || w.mode==='leave') return;
+  var x = px(w.fc), y = py(w.fr) + TILE*0.5;
+  ctx.font = '600 9px "Segoe UI",system-ui,sans-serif';
+  var label = (w.roleIcon||'') + ' ' + w.type;
+  var tw = ctx.measureText(label).width + 8;
+  ctx.fillStyle = 'rgba(22,15,38,.85)';
+  rr(x - tw/2, y, tw, 13, 3); ctx.fill();
+  ctx.fillStyle = '#c9b6f0'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(label, x, y + 6.5);
+}
+
 // petit badge d'icône (pas de texte) au-dessus d'un agent qui bosse
 function drawBadge(w, t){
   if(w.mode==='leave' || w.moving) return;
   var ic = '';
   if(w.mode==='work' && w.tool) ic = toolIcon(w.tool);
   else if(w.mode==='work' && w.isMain) ic = '💭';
-  else if(w.mode==='work' && !w.isMain) ic = '🤝';
+  else if(w.mode==='work' && !w.isMain) ic = w.roleIcon || '🤝';
   else if(w.mode==='rest') ic = '💤';
   else if(w.mode==='relax' && w.amenity) ic = w.amenity.emoji;
   else return;
@@ -1095,6 +1485,34 @@ function drawError(w, t){
   ctx.fillText(txt, x, y - 6);
 }
 
+// bulle "attente d'action" (permission / idle) — pulse pour attirer l'œil
+function drawWaiting(w, t){
+  if(!w.waiting || w.mode==='leave') return;
+  var pulse = 0.6 + 0.4*Math.abs(Math.sin(t*3));
+  var x = px(w.fc), y = py(w.fr) - TILE*0.95;
+  ctx.save(); ctx.globalAlpha = pulse;
+  var txt = '❓ attend';
+  ctx.font = '600 11px "Segoe UI",system-ui,sans-serif';
+  var tw = ctx.measureText(txt).width + 14;
+  ctx.fillStyle = '#ffb020';
+  rr(x - tw/2, y - 16, tw, 20, 6); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(x-5, y+4); ctx.lineTo(x+5, y+4); ctx.lineTo(x, y+11); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#241a00'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(txt, x, y - 6);
+  ctx.restore();
+}
+
+// alerte "bloqué" : anneau rouge pulsant (aucune activité depuis longtemps)
+function drawStale(w, t){
+  if(!w.stale || w.mode==='leave') return;
+  var x = px(w.fc), y = py(w.fr);
+  var pulse = 0.4 + 0.5*Math.abs(Math.sin(t*3));
+  ctx.save(); ctx.globalAlpha = pulse;
+  ctx.strokeStyle = '#f85149'; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.ellipse(x, y + TILE*0.1, TILE*0.46, TILE*0.54, 0, 0, 7); ctx.stroke();
+  ctx.restore();
+}
+
 // anneau de surbrillance (survol / sélection)
 function drawRing(w, sel){
   var x = px(w.fc), y = py(w.fr);
@@ -1119,6 +1537,12 @@ function esc(s){ return String(s==null?'':s).replace(/[&<>]/g,function(c){return
 
 var card = document.getElementById('card');
 var _cardHtml = '';
+function histRow(w){
+  var tk = w.ticks || [];
+  if(!tk.length) return '';
+  var squares = tk.slice(-34).map(function(t){ return '<span class="ctk'+(t.ok?'':' bad')+'" title="'+esc((t.tool||'')+(t.detail?' — '+t.detail:''))+'"></span>'; }).join('');
+  return '<div class="row"><div class="lbl">Derniers outils</div><div class="cticks">'+squares+'</div></div>';
+}
 function updateCard(){
   var w = selectedKey ? workers[selectedKey] : null;
   if(!w){ if(card.classList.contains('open')){ card.classList.remove('open'); _cardHtml=''; } return; }
@@ -1156,6 +1580,7 @@ function updateCard(){
       + (w.task ? '<div class="row"><div class="lbl">Tâche</div><div class="val task">'+esc(w.task)+'</div></div>' : '')
       + '<div class="row"><div class="lbl">En cours</div><div class="val mono">'+esc(action)+'</div></div>'
       + '<div class="row"><div class="lbl">Durée · Actions</div><div class="val">⏱ '+(w.startedAt?durShort(Date.now()-w.startedAt):'—')+'   ·   ⚙ '+(w.actions||0)+' outils</div></div>'
+      + histRow(w)
       + team
     + '</div>';
 
@@ -1165,29 +1590,135 @@ function updateCard(){
 card.addEventListener('click', function(e){
   if(e.target.closest('.cx')){ selectedKey = null; card.classList.remove('open'); _cardHtml=''; }
 });
-cv.addEventListener('mousemove', function(e){
+
+// clic = inspecter un agent ; glisser un bureau = le déplacer (éditeur)
+var drag = null;
+cv.addEventListener('pointerdown', function(e){
+  if(hitTest(e.offsetX, e.offsetY)) return;         // sur un agent → sélection au relâchement
+  var di = deskAt(e.offsetX, e.offsetY);
+  if(di >= 0){ drag = { idx:di, moved:false, ok:true, cell:{c:desks[di].c, r:desks[di].r} }; try{ cv.setPointerCapture(e.pointerId); }catch(x){} }
+});
+cv.addEventListener('pointermove', function(e){
+  if(drag){
+    var cell = cellAt(e.offsetX, e.offsetY);
+    drag.cell = cell; drag.ok = deskFree(cell.c, cell.r, drag.idx); drag.moved = true;
+    cv.classList.add('hot');
+    return;
+  }
   hoverKey = hitTest(e.offsetX, e.offsetY);
   cv.classList.toggle('hot', !!hoverKey);
 });
-cv.addEventListener('click', function(e){
+cv.addEventListener('pointerup', function(e){
+  if(drag){
+    if(drag.moved && drag.ok) moveDesk(drag.idx, drag.cell.c, drag.cell.r);
+    var moved = drag.moved; drag = null; cv.classList.remove('hot');
+    if(moved) return;                                // c'était un déplacement, pas une sélection
+  }
   var k = hitTest(e.offsetX, e.offsetY);
   selectedKey = (k && k===selectedKey) ? null : k;
   updateCard();
+  if(lastData) updateLog(lastData);   // le log se filtre sur l'agent sélectionné
 });
-document.addEventListener('keydown', function(e){ if(e.key==='Escape'){ selectedKey=null; card.classList.remove('open'); _cardHtml=''; } });
+document.addEventListener('keydown', function(e){ if(e.key==='Escape'){ selectedKey=null; card.classList.remove('open'); _cardHtml=''; if(lastData) updateLog(lastData); } });
+
+// panneau Équipe : toggle + clic sur une session → sélectionne son chef
+var teamBtn = document.getElementById('teamBtn');
+teamBtn.addEventListener('click', function(){ var on = teamEl.classList.toggle('open'); teamBtn.classList.toggle('on', on); });
+teamEl.addEventListener('click', function(e){
+  var row = e.target.closest('.row2'); if(!row) return;
+  var sid = row.getAttribute('data-sid');
+  selectedKey = sid + ':main'; updateCard(); if(lastData) updateLog(lastData);
+});
+
+// replier / déplacer le panneau Équipe
+var teamHead = document.getElementById('teamHead');
+var teamCol = document.getElementById('teamCol');
+teamCol.addEventListener('click', function(e){
+  e.stopPropagation();
+  var c = teamEl.classList.toggle('collapsed');
+  try{ localStorage.setItem('agentOfficeTeamCol', c ? '1' : '0'); }catch(x){}
+});
+var tdrag = null;
+teamHead.addEventListener('pointerdown', function(e){
+  if(e.target === teamCol) return;
+  var r = teamEl.getBoundingClientRect();
+  tdrag = { dx: e.clientX - r.left, dy: e.clientY - r.top };
+  try{ teamHead.setPointerCapture(e.pointerId); }catch(x){}
+});
+teamHead.addEventListener('pointermove', function(e){
+  if(!tdrag) return;
+  var x = Math.max(4, Math.min(window.innerWidth - 60, e.clientX - tdrag.dx));
+  var y = Math.max(56, Math.min(window.innerHeight - 40, e.clientY - tdrag.dy));
+  teamEl.style.left = x + 'px'; teamEl.style.top = y + 'px'; teamEl.style.right = 'auto';
+});
+teamHead.addEventListener('pointerup', function(){
+  if(!tdrag) return; tdrag = null;
+  try{ localStorage.setItem('agentOfficeTeamPos', JSON.stringify({ x:parseInt(teamEl.style.left), y:parseInt(teamEl.style.top) })); }catch(x){}
+});
+try{
+  if(localStorage.getItem('agentOfficeTeamCol') === '1') teamEl.classList.add('collapsed');
+  var tp = JSON.parse(localStorage.getItem('agentOfficeTeamPos') || 'null');
+  if(tp){ teamEl.style.left = tp.x + 'px'; teamEl.style.top = tp.y + 'px'; teamEl.style.right = 'auto'; }
+}catch(x){}
+
+// nettoyage manuel des sessions inactives
+document.getElementById('prune').addEventListener('click', function(){
+  fetch('/prune', { method:'POST' }).catch(function(){});
+});
+
+// export d'un rapport Markdown de l'état courant
+var NL = String.fromCharCode(10);
+document.getElementById('rep').addEventListener('click', function(){
+  var S = (lastData && lastData.sessions) || [];
+  var out = ['# Rapport agent-office', '', '_' + new Date().toLocaleString() + '_', ''];
+  for(var i=0;i<S.length;i++){
+    var s = S[i], ags = s.agents || {}, tot = 0;
+    for(var a in ags) tot += (ags[a].actions || 0);
+    out.push('## ' + (s.project||'session') + ' — ' + s.status);
+    if(s.lastPrompt) out.push('- Tâche : ' + s.lastPrompt);
+    out.push('- Actions : ' + tot);
+    for(var aid in ags){ if(aid==='main') continue; var ag = ags[aid]; out.push('  - ' + (ag.type||'agent') + ' (' + ag.status + ')'); }
+    out.push('');
+  }
+  var blob = new Blob([out.join(NL)], { type:'text/markdown' });
+  var url = URL.createObjectURL(blob), el = document.createElement('a');
+  el.href = url; el.download = 'agent-office-rapport.md'; el.click(); URL.revokeObjectURL(url);
+});
 
 // recherche / filtre projet
 var qInput = document.getElementById('q');
 qInput.addEventListener('input', function(){ filter = qInput.value.trim().toLowerCase(); });
 
-// bouton son (off par défaut : les navigateurs bloquent l'audio avant interaction)
+// jour / nuit (cycle : auto → jour → nuit)
+var dayBtn = document.getElementById('day');
+dayBtn.addEventListener('click', function(){
+  nightState = nightState==='auto' ? 'day' : (nightState==='day' ? 'night' : 'auto');
+  dayBtn.textContent = nightState==='day' ? '☀️' : (nightState==='night' ? '🌙' : '🌗');
+  dayBtn.title = 'Jour/nuit : ' + nightState;
+});
+
+// thème clair / sombre (persisté)
+var themeBtn = document.getElementById('theme');
+function applyTheme(){ document.body.classList.toggle('light', themeLight); themeBtn.classList.toggle('on', themeLight); }
+themeBtn.addEventListener('click', function(){
+  themeLight = !themeLight;
+  try{ localStorage.setItem('agentOfficeTheme', themeLight ? 'light' : 'dark'); }catch(e){}
+  applyTheme();
+});
+try{ themeLight = localStorage.getItem('agentOfficeTheme') === 'light'; }catch(e){}
+applyTheme();
+
+// son ON par défaut + permission notifications ; besoin d'un premier geste utilisateur
+window.addEventListener('pointerdown', function(){
+  ensureAudio();
+  try{ if(window.Notification && Notification.permission==='default') Notification.requestPermission(); }catch(e){}
+}, { once:true });
 var sndBtn = document.getElementById('snd');
 sndBtn.addEventListener('click', function(){
   soundOn = !soundOn;
   sndBtn.textContent = soundOn ? '🔊' : '🔇';
   sndBtn.classList.toggle('on', soundOn);
-  if(soundOn && !actx){ try{ actx = new (window.AudioContext || window.webkitAudioContext)(); }catch(e){} }
-  if(actx && actx.state === 'suspended') actx.resume();
+  if(soundOn) ensureAudio();
 });
 
 function draw(t){
@@ -1210,12 +1741,28 @@ function draw(t){
   for(var wp in workers){ var pw = workers[wp]; ctx.globalAlpha = matchFilter(pw) ? 1 : 0.14; drawDeskPlate(pw); ctx.globalAlpha = 1; }
   // discussion entre agents
   drawCollab(t);
+  // voile nuit + lampes (avant les libellés UI pour qu'ils restent lisibles)
+  drawNight(t);
+  // plaque de la salle de réunion (nom du projet)
+  drawMeetingLabel();
+  // labels de type des sous-agents + alertes "bloqué"
+  for(var wl in workers){ if(matchFilter(workers[wl])){ drawSubLabel(workers[wl]); drawStale(workers[wl], t); } }
   // badges + erreurs (masqués pour les persos filtrés)
   for(var wk2 in workers){ if(matchFilter(workers[wk2])) drawBadge(workers[wk2], t); }
   for(var we in workers){ if(matchFilter(workers[we])) drawError(workers[we], t); }
+  for(var ww in workers){ if(matchFilter(workers[ww])) drawWaiting(workers[ww], t); }
   // surbrillance survol + sélection, avec nom uniquement sur l'agent visé
   if(hoverKey && workers[hoverKey] && hoverKey!==selectedKey){ drawRing(workers[hoverKey], false); drawTag(workers[hoverKey]); }
   if(selectedKey && workers[selectedKey]){ drawRing(workers[selectedKey], true); drawTag(workers[selectedKey]); }
+  // aperçu de déplacement de bureau (éditeur)
+  if(typeof drag !== 'undefined' && drag && drag.moved){
+    var gx = OX + drag.cell.c*TILE, gy = OY + drag.cell.r*TILE;
+    ctx.save(); ctx.globalAlpha = 0.55;
+    ctx.fillStyle = drag.ok ? 'rgba(63,185,80,.45)' : 'rgba(248,81,73,.45)';
+    ctx.fillRect(gx, gy, TILE, TILE);
+    ctx.strokeStyle = drag.ok ? '#3fb950' : '#f85149'; ctx.lineWidth = 2; ctx.strokeRect(gx, gy, TILE, TILE);
+    ctx.restore();
+  }
   updateCard();
 }
 
