@@ -33,6 +33,10 @@ const IDLE_MS = 90 * 1000; // after this with no activity → "idle"
 
 const feed = []; // global recent events {ts, session, agent, kind, tool, ok, project}
 
+// ─── Contrôle (kill-switch / blocage d'outils) ───────────────────────────────
+const paused = new Set();   // sessionIds en pause (prochain outil bloqué)
+const blocked = {};         // sessionId -> [noms d'outils bloqués]
+
 function now() { return Date.now(); }
 
 // ─── Persistance disque (survit au redémarrage) ──────────────────────────────
@@ -227,6 +231,7 @@ function handleEvent(ev) {
       agent.status = 'working';
       if (detail) agent.lastAction = detail;
       agent.actions = (agent.actions || 0) + 1;
+      agent.fails = (agent.fails || 0) + 1;
       agent.lastErrorAt = now();
       agent.lastErrorTool = tool || '';
       pushTick(agent, false, tool, detail);
@@ -301,6 +306,8 @@ function snapshot() {
     now: now(),
     sessions: [...sessions.values()].sort((a, b) => b.lastActivity - a.lastActivity),
     feed: [...feed].reverse(),
+    paused: [...paused],
+    blocked,
   };
 }
 
@@ -350,6 +357,39 @@ const server = http.createServer(async (req, res) => {
     sseClients.add(res);
     const ka = setInterval(() => { try { res.write(': ka\n\n'); } catch {} }, 25000);
     req.on('close', () => { clearInterval(ka); sseClients.delete(res); });
+    return;
+  }
+
+  // POST /gate-check — appelé par le hook PreToolUse : doit-on bloquer cet outil ?
+  if (req.method === 'POST' && url.pathname === '/gate-check') {
+    const raw = await readBody(req);
+    let block = false, reason = '';
+    try {
+      const ev = JSON.parse(raw || '{}');
+      const sid = ev.session_id || ev.sessionId || '';
+      const tool = ev.tool_name || ev.toolName || '';
+      if (paused.has(sid)) { block = true; reason = 'Session en pause depuis le bureau agent-office.'; }
+      else if (blocked[sid] && blocked[sid].includes(tool)) { block = true; reason = 'Outil ' + tool + ' bloqué depuis agent-office.'; }
+    } catch { /* ignore */ }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ block, reason }));
+    return;
+  }
+
+  // POST /control — actions depuis l'UI (pause/reprise/blocage d'outil)
+  if (req.method === 'POST' && url.pathname === '/control') {
+    const raw = await readBody(req);
+    try {
+      const b = JSON.parse(raw || '{}');
+      const sid = b.session;
+      if (b.action === 'pause') paused.add(sid);
+      else if (b.action === 'resume') paused.delete(sid);
+      else if (b.action === 'block' && b.tool) { (blocked[sid] = blocked[sid] || []); if (!blocked[sid].includes(b.tool)) blocked[sid].push(b.tool); }
+      else if (b.action === 'unblock') { delete blocked[sid]; }
+    } catch { /* ignore */ }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{}');
+    broadcast();
     return;
   }
 
@@ -451,6 +491,12 @@ const HTML = /* html */ `<!DOCTYPE html>
   body.light #log .lg{ background:rgba(255,255,255,.85); border-color:rgba(180,195,215,.8); border-left-color:#8aa0bd; color:#5a6b7e; }
   body.light #log .lg .la{ color:#1b2431; } body.light #log .lg .lp{ color:#2f5bd0; }
   body.light #empty{ color:#5a6b7e; }
+  body.light #card .cbtn{ background:#eef2f7; border-color:#c6d0dd; color:#1b2431; }
+  body.light #card .cbtn:hover{ border-color:#8aa0bd; }
+  body.light #card .cbtn.on{ background:#fff2d4; border-color:#e6c26a; color:#8a6a00; }
+  body.light #card .cbtn.danger:hover{ border-color:#e0483f; color:#c0392b; }
+  body.light #card .ctk{ background:#3f78d6; }
+  body.light #card .val.alert{ color:#b5760a; }
   #stage{position:absolute;inset:52px 0 0 0}
   canvas{display:block;width:100%;height:100%}
   #empty{position:absolute;inset:52px 0 0 0;display:none;align-items:center;justify-content:center;
@@ -463,6 +509,12 @@ const HTML = /* html */ `<!DOCTYPE html>
   #card .cticks{display:flex;gap:2px;flex-wrap:wrap;align-items:center}
   #card .ctk{width:5px;height:13px;border-radius:1px;background:#4c9aff;opacity:.9}
   #card .ctk.bad{background:#f85149}
+  #card .val.alert{color:var(--amber)}
+  #card .ctrl{display:flex;gap:6px;flex-wrap:wrap}
+  #card .cbtn{cursor:pointer;font-size:11px;padding:5px 9px;border-radius:7px;border:1px solid #26344c;background:#0e131c;color:var(--txt)}
+  #card .cbtn:hover{border-color:#3a4c6b}
+  #card .cbtn.on{background:#231c08;border-color:#4a3a10;color:var(--amber)}
+  #card .cbtn.danger:hover{border-color:#f85149;color:#f85149}
 
   /* panneau Équipe (vue d'ensemble agents + sous-agents) */
   #team{position:absolute;top:66px;left:14px;width:300px;max-width:calc(100% - 28px);
@@ -756,10 +808,31 @@ function durShort(ms){
 
 // ── filtre projet ─────────────────────────────────────────────────────────────
 var filter = '';
+var pinnedKey = null;   // focus : n'affiche que cette session
 function matchFilter(w){
+  if(pinnedKey && workers[pinnedKey] && w.sid !== workers[pinnedKey].sid) return false;
   if(!filter) return true;
   var hay = ((w.name||'') + ' ' + (w.type||'') + ' ' + (w.tool||'') + ' ' + (w.action||'')).toLowerCase();
   return hay.indexOf(filter) >= 0;
+}
+
+// détecte les situations à surveiller (boucle, échecs en série, attente longue, inactivité)
+function computeAlert(w){
+  w.alert = false; w.alertMsg = '';
+  var tk = w.ticks || [], i;
+  if(tk.length >= 4){                       // même outil répété → boucle probable
+    var last = tk[tk.length-1].tool, same = 0;
+    for(i=tk.length-1; i>=0 && last && tk[i].tool===last; i--) same++;
+    if(same >= 4){ w.alert = true; w.alertMsg = 'boucle ? ' + same + '× ' + last; }
+  }
+  if(!w.alert && tk.length >= 2){           // échecs consécutifs
+    var f = 0; for(i=tk.length-1; i>=0 && !tk[i].ok; i--) f++;
+    if(f >= 2){ w.alert = true; w.alertMsg = f + ' échecs de suite'; }
+  }
+  if(!w.alert && w.waiting && w.waitSince && (clockNow()-w.waitSince) > 120){
+    w.alert = true; w.alertMsg = 'en attente depuis ' + durShort((clockNow()-w.waitSince)*1000);
+  }
+  if(!w.alert && w.stale){ w.alert = true; w.alertMsg = 'aucune activité depuis un moment'; }
 }
 
 // ── thème clair / sombre (palette du canvas) ──────────────────────────────────
@@ -861,6 +934,7 @@ function makeWorker(k, pal, name, isMain){
     facing:'up', moving:false, pose:'walk', amenity:null, deskChair:null,
     errSeen:0, errUntil:0, errTool:'', actions:0, startedAt:0, restSince:null,
     energy:100, teleUntil:0, waiting:false, roleIcon:'🤝', stale:false, ticks:[],
+    fails:0, paused:false, blockedTools:[], waitSince:0, alert:false, alertMsg:'',
     rainUntil:performance.now()*0.001 + 1.4,   // pluie "Matrix" à l'arrivée
     spawn:performance.now()*0.001, dead:false
   };
@@ -998,6 +1072,9 @@ function applyState(state){
       w.startedAt = sess.startedAt || 0;
       w.waiting = main ? !!main.waiting : false;
       w.ticks = main ? (main.ticks || []) : [];
+      w.fails = main ? (main.fails || 0) : 0;
+      w.paused = (state.paused||[]).indexOf(sess.id) >= 0;
+      w.blockedTools = (state.blocked||{})[sess.id] || [];
       w.stale = (sess.status==='working' && (state.now - (sess.lastActivity||0)) > 45000);
       if(main) noteErr(w, main);
       w.deskChair = desks[di].chair;
@@ -1035,6 +1112,8 @@ function applyState(state){
       sw.startedAt = a.startedAt || sess.startedAt || 0;
       sw.waiting = !!a.waiting;
       sw.ticks = a.ticks || [];
+      sw.fails = a.fails || 0;
+      sw.paused = (state.paused||[]).indexOf(sess.id) >= 0;
       noteErr(sw, a);
       sw.home = inMeeting ? (MEETING.seats[(subIdx+1) % MEETING.seats.length]) : subSpot(di, subIdx);
       sw.mode = 'work';
@@ -1044,6 +1123,16 @@ function applyState(state){
 
   // workers dont la session/agent a disparu → ils partent
   for(var wk in workers){ if(!desired[wk]) workers[wk].mode = 'leave'; }
+
+  // alertes + titre d'onglet (nb de sessions en alerte)
+  var alerts = 0;
+  for(var ak in workers){
+    var aw = workers[ak];
+    if(aw.waiting){ if(!aw.waitSince) aw.waitSince = clockNow(); } else aw.waitSince = 0;
+    computeAlert(aw);
+    if(aw.isMain && aw.alert) alerts++;
+  }
+  document.title = (alerts ? '('+alerts+'⚠) ' : '') + 'agent-office';
 
   updateLog(state);    // mini-log d'activité
   updateTeam(state);   // panneau Équipe
@@ -1513,6 +1602,28 @@ function drawStale(w, t){
   ctx.restore();
 }
 
+// marqueur ⚠️ (boucle / échecs / attente) à côté de la tête
+function drawAlertMark(w, t){
+  if(!w.alert || w.mode==='leave') return;
+  var x = px(w.fc) + TILE*0.26, y = py(w.fr) - TILE*0.58;
+  var s = 0.9 + 0.15*Math.abs(Math.sin(t*5));
+  ctx.font = Math.round(TILE*0.24*s) + 'px "Segoe UI",system-ui,sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('⚠️', x, y);
+}
+
+// session en pause (kill-switch) : anneau cyan + ⏸
+function drawPaused(w, t){
+  if(!w.paused || w.mode==='leave') return;
+  var x = px(w.fc), y = py(w.fr);
+  ctx.save();
+  ctx.strokeStyle = '#22b8c0'; ctx.lineWidth = 3; ctx.globalAlpha = 0.5 + 0.4*Math.abs(Math.sin(t*2.5));
+  ctx.beginPath(); ctx.ellipse(x, y + TILE*0.1, TILE*0.46, TILE*0.54, 0, 0, 7); ctx.stroke();
+  ctx.globalAlpha = 1; ctx.font = Math.round(TILE*0.26)+'px "Segoe UI",sans-serif';
+  ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText('⏸', x - TILE*0.26, y - TILE*0.58);
+  ctx.restore();
+}
+
 // anneau de surbrillance (survol / sélection)
 function drawRing(w, sel){
   var x = px(w.fc), y = py(w.fr);
@@ -1579,8 +1690,15 @@ function updateCard(){
     + '<div class="cbody">'
       + (w.task ? '<div class="row"><div class="lbl">Tâche</div><div class="val task">'+esc(w.task)+'</div></div>' : '')
       + '<div class="row"><div class="lbl">En cours</div><div class="val mono">'+esc(action)+'</div></div>'
-      + '<div class="row"><div class="lbl">Durée · Actions</div><div class="val">⏱ '+(w.startedAt?durShort(Date.now()-w.startedAt):'—')+'   ·   ⚙ '+(w.actions||0)+' outils</div></div>'
+      + '<div class="row"><div class="lbl">Durée · Actions · Échecs</div><div class="val">⏱ '+(w.startedAt?durShort(Date.now()-w.startedAt):'—')+'   ·   ⚙ '+(w.actions||0)+'   ·   ❌ '+(w.fails||0)+(w.actions?' ('+Math.round(100*(w.fails||0)/w.actions)+'%)':'')+'</div></div>'
+      + (w.alert ? '<div class="row"><div class="lbl">⚠ Alerte</div><div class="val alert">'+esc(w.alertMsg)+'</div></div>' : '')
       + histRow(w)
+      + '<div class="row"><div class="lbl">Contrôle</div><div class="ctrl">'
+        + '<span class="cbtn '+(w.paused?'on':'')+'" data-act="'+(w.paused?'resume':'pause')+'">'+(w.paused?'▶ Reprendre':'⏸ Pause')+'</span>'
+        + (w.tool ? '<span class="cbtn danger" data-act="block" data-tool="'+esc(w.tool)+'">🚫 Bloquer '+esc(w.tool)+'</span>' : '')
+        + ((w.blockedTools&&w.blockedTools.length) ? '<span class="cbtn" data-act="unblock">Débloquer ('+w.blockedTools.length+')</span>' : '')
+        + '<span class="cbtn '+(pinnedKey===w.key?'on':'')+'" data-act="pin">📌 '+(pinnedKey===w.key?'Épinglé':'Focus')+'</span>'
+      + '</div></div>'
       + team
     + '</div>';
 
@@ -1588,7 +1706,14 @@ function updateCard(){
   if(!card.classList.contains('open')) card.classList.add('open');
 }
 card.addEventListener('click', function(e){
-  if(e.target.closest('.cx')){ selectedKey = null; card.classList.remove('open'); _cardHtml=''; }
+  if(e.target.closest('.cx')){ selectedKey = null; card.classList.remove('open'); _cardHtml=''; return; }
+  var btn = e.target.closest('.cbtn'); if(!btn) return;
+  var w = selectedKey ? workers[selectedKey] : null; if(!w) return;
+  var act = btn.getAttribute('data-act');
+  if(act === 'pin'){ pinnedKey = (pinnedKey===w.key) ? null : w.key; _cardHtml=''; updateCard(); return; }
+  var body = { action: act, session: w.sid };
+  if(act === 'block') body.tool = btn.getAttribute('data-tool');
+  fetch('/control', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }).catch(function(){});
 });
 
 // clic = inspecter un agent ; glisser un bureau = le déplacer (éditeur)
@@ -1745,8 +1870,9 @@ function draw(t){
   drawNight(t);
   // plaque de la salle de réunion (nom du projet)
   drawMeetingLabel();
-  // labels de type des sous-agents + alertes "bloqué"
-  for(var wl in workers){ if(matchFilter(workers[wl])){ drawSubLabel(workers[wl]); drawStale(workers[wl], t); } }
+  // labels de type des sous-agents + alertes "bloqué" + pause + alerte
+  for(var wl in workers){ if(matchFilter(workers[wl])){ var lw = workers[wl];
+    drawSubLabel(lw); drawStale(lw, t); drawPaused(lw, t); drawAlertMark(lw, t); } }
   // badges + erreurs (masqués pour les persos filtrés)
   for(var wk2 in workers){ if(matchFilter(workers[wk2])) drawBadge(workers[wk2], t); }
   for(var we in workers){ if(matchFilter(workers[we])) drawError(workers[we], t); }
