@@ -571,6 +571,9 @@ const HTML = /* html */ `<!DOCTYPE html>
   #card .team{display:flex;flex-direction:column;gap:6px}
   #card .tm{display:flex;align-items:center;gap:8px;font-size:12px;background:#0d131d;border:1px solid #1a2434;
     border-radius:8px;padding:6px 9px}
+  #card .tm.row3{cursor:pointer;transition:border-color .12s}
+  #card .tm.row3:hover{border-color:#3a4c6b}
+  #card .tm.row3:hover .tn{color:#c9b6f0}
   #card .tm .tdot{width:7px;height:7px;border-radius:50%;background:var(--amber);flex:none}
   #card .tm .tn{color:#c9b6f0;flex:none}
   #card .tm .ta{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1672,7 +1675,8 @@ function updateCard(){
     if(subs.length){
       var rows = subs.map(function(o){
         var act = o.tool ? (toolIcon(o.tool)+' '+o.tool) : (o.action || 'en renfort…');
-        return '<div class="tm"><span class="tdot"></span><span class="tn">'+esc(o.type||'agent')+'</span>'
+        return '<div class="tm row3" data-key="'+esc(o.key)+'"><span class="tdot"></span>'+(o.roleIcon||'')
+             + ' <span class="tn">'+esc(o.type||'agent')+'</span>'
              + '<span class="ta">'+esc(act)+'</span></div>';
       }).join('');
       team = '<div class="row"><div class="lbl">Discute avec ('+subs.length+')</div><div class="team">'+rows+'</div></div>';
@@ -1707,6 +1711,10 @@ function updateCard(){
 }
 card.addEventListener('click', function(e){
   if(e.target.closest('.cx')){ selectedKey = null; card.classList.remove('open'); _cardHtml=''; return; }
+  var tm = e.target.closest('.tm'); // clic sur un sous-agent → l'inspecter
+  if(tm && tm.getAttribute('data-key') && workers[tm.getAttribute('data-key')]){
+    selectedKey = tm.getAttribute('data-key'); _cardHtml=''; updateCard(); if(lastData) updateLog(lastData); return;
+  }
   var btn = e.target.closest('.cbtn'); if(!btn) return;
   var w = selectedKey ? workers[selectedKey] : null; if(!w) return;
   var act = btn.getAttribute('data-act');
