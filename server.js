@@ -641,6 +641,36 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // GET /api/subagents — activité RÉELLE des sous-agents, extraite des sidechains du transcript
+  if (req.method === 'GET' && url.pathname === '/api/subagents') {
+    const sid = url.searchParams.get('session') || '';
+    const s = sessions.get(sid);
+    const out = [];
+    if (s && s.transcriptPath) {
+      try {
+        let raw = fs.readFileSync(s.transcriptPath, 'utf8');
+        if (raw.length > 8 * 1024 * 1024) raw = raw.slice(raw.length - 8 * 1024 * 1024);
+        for (const ln of raw.split('\n')) {
+          if (!ln || ln.indexOf('isSidechain') < 0) continue;
+          let o; try { o = JSON.parse(ln); } catch { continue; }
+          if (!o.isSidechain) continue;
+          const msg = o.message || o;
+          if (!Array.isArray(msg.content)) continue;
+          for (const c of msg.content) {
+            if (c && c.type === 'tool_use') {
+              out.push({ tool: c.name, detail: summarize({ tool_input: c.input }, 'PreToolUse', c.name), ts: o.timestamp || 0 });
+            } else if (c && c.type === 'text' && c.text && c.text.trim()) {
+              out.push({ tool: '', detail: clip(c.text, 140), ts: o.timestamp || 0, text: true });
+            }
+          }
+        }
+      } catch { /* illisible */ }
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ acts: out.slice(-80) }));
+    return;
+  }
+
   // GET /api/state — JSON snapshot (debug / intégrations)
   if (req.method === 'GET' && url.pathname === '/api/state') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -829,6 +859,43 @@ const HTML = /* html */ `<!DOCTYPE html>
   #stats .hm1{background:#1c4a2e} #stats .hm2{background:#2f8f4e} #stats .hm3{background:#3fb950}
   body.light #stats .hm{background:#dde5ef} body.light #stats .hm1{background:#a9dcbb}
   body.light #stats .hm2{background:#4bbf6f} body.light #stats .hm3{background:#2f9d4e}
+
+  /* tooltip au survol */
+  #tip{position:absolute;z-index:14;pointer-events:none;display:none;max-width:260px;
+    background:rgba(10,16,26,.96);border:1px solid #26344c;border-radius:9px;padding:8px 10px;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+  #tip.show{display:block}
+  #tip .tn{font-weight:600;font-size:12px;color:var(--txt)}
+  #tip .tt{color:#ffe08a;font-size:11px;margin-top:3px}
+  #tip .ta{color:var(--dim);font-size:11px;margin-top:3px;font-family:"Consolas",monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  body.light #tip{background:rgba(255,255,255,.97);border-color:#c6d0dd}
+
+  /* badge compteur sur un bouton header */
+  header .sbtn{position:relative}
+  header .sbtn .cnt{position:absolute;top:-5px;right:-5px;min-width:15px;height:15px;border-radius:8px;background:#f85149;
+    color:#fff;font-size:9px;line-height:15px;text-align:center;padding:0 3px;font-weight:700}
+
+  /* centre de notifications */
+  #notif{position:absolute;top:66px;right:16px;width:320px;max-width:calc(100% - 32px);max-height:calc(100% - 90px);z-index:11;
+    background:linear-gradient(180deg,#141b28,#0e131c);border:1px solid #26344c;border-radius:14px;
+    box-shadow:0 18px 50px rgba(0,0,0,.6);display:none;flex-direction:column;overflow:hidden}
+  #notif.open{display:flex}
+  #notif h3{font-size:12px;margin:0;padding:12px 14px;border-bottom:1px solid var(--line);color:var(--dim);text-transform:uppercase;letter-spacing:1px;display:flex}
+  #notif h3 .nx{margin-left:auto;cursor:pointer}
+  #notif .nb{overflow:auto;padding:6px}
+  #notif .ni{display:flex;gap:8px;align-items:baseline;padding:7px 9px;border-radius:8px;font-size:12px;margin:2px 0;border:1px solid #1a2434;background:#0d131d}
+  #notif .ni.fail{border-left:3px solid #f85149} #notif .ni.done{border-left:3px solid #3fb950}
+  #notif .ni.warn{border-left:3px solid #ffb020} #notif .ni.appr{border-left:3px solid #a371f7}
+  #notif .ni .nt{color:var(--dim2,#5c6b7e);font-size:10px;flex:none;width:52px}
+  #notif .ni .np{color:#bcd4ff;flex:none}
+  #notif .ni .nm{color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  body.light #notif{background:linear-gradient(180deg,#fff,#eef2f7);border-color:#c6d0dd}
+  body.light #notif .ni{background:#f1f4f9;border-color:#d6dee9}
+
+  /* team : groupes par projet */
+  #team .tgrp{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim);padding:6px 8px 2px;cursor:pointer;display:flex;gap:6px;align-items:center}
+  #team .tgrp .tgc{color:var(--dim2,#5c6b7e)}
+  #team .tgrp.col .tgi{transform:rotate(-90deg)}
+  #team .tgi{transition:transform .15s;display:inline-block}
 
   /* approbations : cartes ancrées près du perso */
   #approve{position:absolute;inset:52px 0 0 0;z-index:13;pointer-events:none;overflow:hidden}
@@ -1027,6 +1094,8 @@ const HTML = /* html */ `<!DOCTYPE html>
   <div class="tools2">
     <input id="q" type="text" placeholder="🔍 filtrer (projet, outil, action…)" autocomplete="off">
     <span class="sbtn on" id="teamBtn" title="Panneau Équipe">👥</span>
+    <span class="sbtn" id="spotBtn" title="Projecteur : suivre l'agent actif">🎯</span>
+    <span class="sbtn" id="notifBtn" title="Centre de notifications">🛎️</span>
     <span class="sbtn" id="listBtn" title="Vue liste compacte (m)">☰</span>
     <span class="sbtn" id="statsBtn" title="Statistiques (s)">📊</span>
     <span class="sbtn" id="radarBtn" title="Radar d'anomalies">📡</span>
@@ -1084,6 +1153,8 @@ const HTML = /* html */ `<!DOCTYPE html>
   <span id="rpTime">—</span>
   <span id="rpExit" title="Quitter le replay">✕ live</span>
 </div>
+<div id="tip"></div>
+<div id="notif"></div>
 <div id="approve"></div>
 <div id="convo">
   <div id="convoHead"><span id="convoTitle">💬 Conversation</span><span id="convoX" title="Fermer">✕</span></div>
@@ -1302,6 +1373,7 @@ var durAlertMin = 0;    // alerte si session > X min (0 = off)
 try{ durAlertMin = parseInt(localStorage.getItem('agentOfficeDurAlert')) || 0; }catch(e){}
 var iso3d = false;      // relief 2.5D (volume des bureaux + ombres)
 try{ iso3d = localStorage.getItem('agentOfficeIso') === '1'; }catch(e){}
+var spotlight = false;  // projecteur : la caméra suit l'agent actif
 function matchFilter(w){
   if(pinnedKey && workers[pinnedKey] && w.sid !== workers[pinnedKey].sid) return false;
   if(!filter) return true;
@@ -1475,27 +1547,40 @@ var teamEl = document.getElementById('team');
 var teamBodyEl = document.getElementById('teamBody');
 var teamTotEl = document.getElementById('teamTot');
 var _teamHtml = '';
+var collapsedProj = {};
+function sessionRow(s){
+  var col = palOf(s.project||s.id).sh, main = s.agents && s.agents.main;
+  var act = (main && main.currentTool) ? (toolIcon(main.currentTool)+' '+main.currentTool+(main.lastAction?' — '+main.lastAction:''))
+          : (main && main.lastAction ? main.lastAction : (s.lastPrompt||'…'));
+  var subs = '', subCount = 0, ags = s.agents || {};
+  for(var aid in ags){ if(aid==='main') continue; var a = ags[aid]; if(a.status==='done') continue; subCount++;
+    var ri = roleInfo(a.type), life = a.startedAt ? durShort(Date.now()-a.startedAt) : '';
+    var sact = a.currentTool ? (toolIcon(a.currentTool)+' '+a.currentTool) : (a.lastAction||'en renfort');
+    subs += '<div class="sub">'+ri.icon+' '+esc(a.type||'agent')+'<span class="sa">'+esc(sact)+' · '+life+'</span></div>';
+  }
+  return { subCount:subCount, html:'<div class="ts"><div class="th row2" data-sid="'+esc(s.id)+'">'
+    + '<span class="dot" style="background:'+col+'"></span>'
+    + '<span class="pn">'+esc(s.project||'session')+'</span>'
+    + (subCount?'<span style="color:#8b98a9;font-size:10px">+'+subCount+'</span>':'')
+    + (s.host&&s.host!=='local'?'<span style="color:#8b98a9;font-size:9px">🖥️'+esc(s.host)+'</span>':'')
+    + '<span class="stt '+s.status+'">'+esc(s.status)+'</span></div>'
+    + '<div class="ac">'+esc(act)+'</div>' + subs + '</div>' };
+}
 function updateTeam(state){
   var S = (state.sessions || []).slice().sort(function(a,b){ return a.startedAt - b.startedAt; });
+  // regroupe par projet
+  var groups = {}, order = [];
+  for(var i=0;i<S.length;i++){ var p = S[i].project||'?'; if(!groups[p]){ groups[p]=[]; order.push(p); } groups[p].push(S[i]); }
   var rows = '', totAgents = 0;
-  for(var i=0;i<S.length;i++){
-    var s = S[i], col = palOf(s.project||s.id).sh, main = s.agents && s.agents.main;
-    var act = (main && main.currentTool) ? (toolIcon(main.currentTool)+' '+main.currentTool+(main.lastAction?' — '+main.lastAction:''))
-            : (main && main.lastAction ? main.lastAction : (s.lastPrompt||'…'));
-    var subs = '', subCount = 0, ags = s.agents || {};
-    for(var aid in ags){ if(aid==='main') continue; var a = ags[aid]; if(a.status==='done') continue; subCount++;
-      var ri = roleInfo(a.type), life = a.startedAt ? durShort(Date.now()-a.startedAt) : '';
-      var sact = a.currentTool ? (toolIcon(a.currentTool)+' '+a.currentTool) : (a.lastAction||'en renfort');
-      subs += '<div class="sub">'+ri.icon+' '+esc(a.type||'agent')+'<span class="sa">'+esc(sact)+' · '+life+'</span></div>';
-    }
-    totAgents += 1 + subCount;
-    rows += '<div class="ts"><div class="th row2" data-sid="'+esc(s.id)+'">'
-      + '<span class="dot" style="background:'+col+'"></span>'
-      + '<span class="pn">'+esc(s.project||'session')+'</span>'
-      + (subCount?'<span style="color:#8b98a9;font-size:10px">+'+subCount+'</span>':'')
-      + (s.host&&s.host!=='local'?'<span style="color:#8b98a9;font-size:9px">🖥️'+esc(s.host)+'</span>':'')
-      + '<span class="stt '+s.status+'">'+esc(s.status)+'</span></div>'
-      + '<div class="ac">'+esc(act)+'</div>' + subs + '</div>';
+  for(var g=0; g<order.length; g++){
+    var p = order[g], list = groups[p], col = palOf(p).sh, gAgents = 0, body = '';
+    for(var j=0;j<list.length;j++){ var r = sessionRow(list[j]); gAgents += 1 + r.subCount; body += r.html; }
+    totAgents += gAgents;
+    var isCol = !!collapsedProj[p];
+    rows += '<div class="tgrp'+(isCol?' col':'')+'" data-proj="'+esc(p)+'"><span class="tgi">▾</span>'
+      + '<span class="dot" style="background:'+col+';width:8px;height:8px;border-radius:50%"></span> '+esc(p)
+      + '<span class="tgc">'+list.length+'</span></div>';
+    if(!isCol) rows += body;
   }
   if(!rows) rows = '<div style="padding:14px;color:#5c6b7e;font-size:12px">Aucune session.</div>';
   var html = '<div class="tbody">'+rows+'</div>';
@@ -1913,6 +1998,7 @@ function applyState(state){
   if(!replaying){
     document.getElementById('hookBtn').classList.toggle('on', !!state.webhook);
     if(state.rules){ rulesLocal = state.rules; if(document.getElementById('cfg').classList.contains('open')) renderRules(); }
+    updateNotif(state);  // centre de notifications (badge + panneau)
     checkNotifs();       // notifications navigateur
     playSounds(state);   // sons sur nouveaux events (si activés)
   }
@@ -1966,6 +2052,13 @@ function update(dt, t){
   }
   for(var dk in workers){ if(workers[dk].dead) delete workers[dk]; }
 
+  // projecteur : la caméra vise l'agent épinglé ou le premier agent actif
+  if(spotlight && !replaying){
+    var tgt = (pinnedKey && workers[pinnedKey]) ? workers[pinnedKey] : null;
+    if(!tgt){ for(var swk in workers){ if(workers[swk].tool){ tgt = workers[swk]; break; } } }
+    if(tgt){ cam.ts = 1.8; cam.tfx = px(tgt.fc); cam.tfy = py(tgt.fr); }
+    else { cam.ts = 1; var oc = officeCenter(); cam.tfx = oc.x; cam.tfy = oc.y; }
+  }
   // caméra : lerp doux vers la cible (zoom)
   var kf = Math.min(1, dt*8);
   cam.s += (cam.ts - cam.s)*kf; cam.fx += (cam.tfx - cam.fx)*kf; cam.fy += (cam.tfy - cam.fy)*kf;
@@ -2513,6 +2606,7 @@ function updateCard(){
       + toolsRow(w)
       + '<div class="row"><div class="lbl">Contrôle</div><div class="ctrl">'
         + '<span class="cbtn" data-act="convo">💬 Conversation</span>'
+        + (w.isMain ? '<span class="cbtn" data-act="subs">🔎 Sous-agents</span>' : '')
         + '<span class="cbtn" data-act="hist">🕘 Historique</span>'
         + '<span class="cbtn '+(w.paused?'on':'')+'" data-act="'+(w.paused?'resume':'pause')+'">'+(w.paused?'▶ Reprendre':'⏸ Pause')+'</span>'
         + (w.tool ? '<span class="cbtn danger" data-act="block" data-tool="'+esc(w.tool)+'">🚫 Bloquer '+esc(w.tool)+'</span>' : '')
@@ -2537,6 +2631,7 @@ card.addEventListener('click', function(e){
   var act = btn.getAttribute('data-act');
   if(act === 'hist'){ openHist(w.sid, w.name); return; }
   if(act === 'convo'){ openConvo(w.sid, w.name); return; }
+  if(act === 'subs'){ openSubs(w.sid, w.name); return; }
   if(act === 'pin'){ pinnedKey = (pinnedKey===w.key) ? null : w.key; _cardHtml=''; updateCard(); return; }
   var body = { action: act, session: w.sid };
   if(act === 'block') body.tool = btn.getAttribute('data-tool');
@@ -2561,7 +2656,16 @@ cv.addEventListener('pointermove', function(e){
   }
   hoverKey = hitTest(wp.x, wp.y);
   cv.classList.toggle('hot', !!hoverKey);
+  var tip = document.getElementById('tip');
+  if(hoverKey && workers[hoverKey]){
+    var hw = workers[hoverKey];
+    tip.innerHTML = '<div class="tn">'+esc(hw.name)+(hw.isMain?'':' · '+esc(hw.type||''))+(hw.host&&hw.host!=='local'?' · 🖥️'+esc(hw.host):'')+'</div>'
+      + (hw.isMain && hw.task ? '<div class="tt">'+esc(hw.task)+'</div>' : '')
+      + (hw.action ? '<div class="ta">'+esc(hw.action)+'</div>' : '');
+    tip.style.left = Math.min(STW-270, e.clientX+14) + 'px'; tip.style.top = (e.clientY+14) + 'px'; tip.classList.add('show');
+  } else tip.classList.remove('show');
 });
+cv.addEventListener('pointerleave', function(){ document.getElementById('tip').classList.remove('show'); });
 cv.addEventListener('pointerup', function(e){
   if(drag){
     if(drag.moved && drag.ok) moveDesk(drag.idx, drag.cell.c, drag.cell.r);
@@ -2584,7 +2688,7 @@ document.addEventListener('keydown', function(e){
   if((e.ctrlKey||e.metaKey) && (e.key||'').toLowerCase()==='k'){ e.preventDefault(); openPalette(); return; }
   if(e.target && e.target.tagName === 'INPUT') return;
   var k = (e.key||'').toLowerCase();
-  if(e.key === 'Escape'){ selectedKey=null; card.classList.remove('open'); _cardHtml=''; listEl.classList.remove('open'); statsEl.classList.remove('open'); histEl.classList.remove('open'); radarEl.classList.remove('open'); document.getElementById('cfg').classList.remove('open'); convoEl.classList.remove('open'); if(lastData) updateLog(lastData); return; }
+  if(e.key === 'Escape'){ selectedKey=null; card.classList.remove('open'); _cardHtml=''; listEl.classList.remove('open'); statsEl.classList.remove('open'); histEl.classList.remove('open'); radarEl.classList.remove('open'); document.getElementById('cfg').classList.remove('open'); convoEl.classList.remove('open'); notifEl.classList.remove('open'); if(lastData) updateLog(lastData); return; }
   if(k === 'f'){ toggleTV(); }
   else if(k === 's'){ document.getElementById('statsBtn').click(); }
   else if(k === 'h'){ document.getElementById('histBtn').click(); }
@@ -2599,6 +2703,8 @@ document.addEventListener('keydown', function(e){
 var teamBtn = document.getElementById('teamBtn');
 teamBtn.addEventListener('click', function(){ var on = teamEl.classList.toggle('open'); teamBtn.classList.toggle('on', on); });
 teamEl.addEventListener('click', function(e){
+  var grp = e.target.closest('.tgrp');
+  if(grp){ var p = grp.getAttribute('data-proj'); collapsedProj[p] = !collapsedProj[p]; if(lastData) updateTeam(lastData); return; }
   var row = e.target.closest('.row2'); if(!row) return;
   var sid = row.getAttribute('data-sid');
   selectedKey = sid + ':main'; updateCard(); if(lastData) updateLog(lastData);
@@ -2715,10 +2821,22 @@ function updateApprovalCards(){
 }
 
 // ── conversation live (prose de l'agent depuis le transcript) ─────────────────
-var convoEl = document.getElementById('convo'), convoBody = document.getElementById('convoBody'), convoTitle = document.getElementById('convoTitle'), convoSid = '';
-function openConvo(sid, name){ convoSid = sid; convoTitle.textContent = '💬 ' + (name||''); convoEl.classList.add('open'); fetchConvo(); }
+var convoEl = document.getElementById('convo'), convoBody = document.getElementById('convoBody'), convoTitle = document.getElementById('convoTitle'), convoSid = '', convoMode = 'chat';
+function openConvo(sid, name){ convoSid = sid; convoMode = 'chat'; convoTitle.textContent = '💬 ' + (name||''); convoEl.classList.add('open'); fetchConvo(); }
+function openSubs(sid, name){ convoSid = sid; convoMode = 'subs'; convoTitle.textContent = '🔎 Sous-agents · ' + (name||''); convoEl.classList.add('open'); fetchConvo(); }
 function fetchConvo(){
   if(!convoSid) return;
+  if(convoMode === 'subs'){
+    fetch('/api/subagents?session=' + encodeURIComponent(convoSid)).then(function(r){ return r.json(); }).then(function(d){
+      var a = d.acts || [];
+      convoBody.innerHTML = a.length ? a.map(function(x){
+        return x.text ? '<div class="msg assistant"><span class="r">sous-agent · note</span>'+esc(x.detail)+'</div>'
+                      : '<div class="msg user"><span class="r">'+esc(x.tool||'outil')+'</span>'+esc(x.detail||'')+'</div>';
+      }).join('') : '<div style="padding:16px;color:#5c6b7e">Aucune activité de sous-agent détectée dans le transcript.</div>';
+      convoBody.scrollTop = convoBody.scrollHeight;
+    }).catch(function(){});
+    return;
+  }
   fetch('/api/transcript?session=' + encodeURIComponent(convoSid) + '&limit=40').then(function(r){ return r.json(); }).then(function(d){
     var m = d.messages || [];
     convoBody.innerHTML = m.length ? m.map(function(x){ return '<div class="msg '+x.role+'"><span class="r">'+x.role+'</span>'+esc(x.text)+'</div>'; }).join('') : '<div style="padding:16px;color:#5c6b7e">Pas de conversation lisible.</div>';
@@ -2774,6 +2892,34 @@ radarEl.addEventListener('click', function(e){
 document.getElementById('ambBtn').addEventListener('click', function(){
   ambientOn = !ambientOn; this.classList.toggle('on', ambientOn); if(ambientOn) ensureAudio();
 });
+
+// projecteur : suivre l'agent actif
+document.getElementById('spotBtn').addEventListener('click', function(){
+  spotlight = !spotlight; this.classList.toggle('on', spotlight);
+  if(!spotlight){ cam.ts=1; var c=officeCenter(); cam.tfx=c.x; cam.tfy=c.y; }
+});
+
+// centre de notifications
+var notifEl = document.getElementById('notif'), lastNotifTs = 0;
+notifEl.innerHTML = '<h3>🛎️ Notifications <span class="nx">✕</span></h3><div class="nb"></div>';
+function updateNotif(state){
+  var f = state.feed || [];
+  var items = f.filter(function(e){ return e.kind==='PostToolUseFailure'||e.kind==='Stop'||e.kind==='SessionEnd'; }).slice(0,40);
+  var unseen = items.filter(function(e){ return e.ts > lastNotifTs; }).length + ((state.approvals||[]).length);
+  var btn = document.getElementById('notifBtn'), ex = btn.querySelector('.cnt');
+  if(unseen>0){ if(!ex){ ex=document.createElement('span'); ex.className='cnt'; btn.appendChild(ex); } ex.textContent = unseen>99?'99+':unseen; }
+  else if(ex){ ex.remove(); }
+  if(notifEl.classList.contains('open')){
+    var rows = (state.approvals||[]).map(function(a){ return '<div class="ni appr"><span class="nt">⏳</span><span class="np">'+esc(a.project)+'</span><span class="nm">🖐️ attend : '+esc(a.tool)+'</span></div>'; }).join('')
+      + items.map(function(e){ var cls = e.kind==='PostToolUseFailure'?'fail':'done'; return '<div class="ni '+cls+'"><span class="nt">'+fmtT(e.ts)+'</span><span class="np">'+esc(e.project||'')+'</span><span class="nm">'+esc(e.detail||e.kind)+'</span></div>'; }).join('');
+    notifEl.querySelector('.nb').innerHTML = rows || '<div style="padding:16px;color:#5c6b7e">Rien pour l\\'instant.</div>';
+  }
+}
+document.getElementById('notifBtn').addEventListener('click', function(){
+  var on = notifEl.classList.toggle('open'); this.classList.toggle('on', on);
+  if(on){ lastNotifTs = (lastData && lastData.now) || Date.now(); var ex=this.querySelector('.cnt'); if(ex) ex.remove(); if(lastData) updateNotif(lastData); }
+});
+notifEl.querySelector('.nx').addEventListener('click', function(){ notifEl.classList.remove('open'); document.getElementById('notifBtn').classList.remove('on'); });
 
 // panneau de configuration unifié
 var cfgEl = document.getElementById('cfg');
