@@ -1217,7 +1217,7 @@ const HTML = /* html */ `<!DOCTYPE html>
     <span class="sbtn" id="prune" title="Nettoyer les sessions inactives">🧹</span>
     <span class="sbtn" id="rep" title="Exporter un rapport Markdown">📄</span>
     <span class="sbtn" id="theme" title="Thème clair / sombre">🌓</span>
-    <span class="sbtn" id="day" title="Jour / nuit">🌗</span>
+    <span class="sbtn" id="day" title="Jour / nuit">☀️</span>
     <span class="sbtn on" id="snd" title="Sons (fin d'agent + erreurs)">🔊</span>
   </div>
 </header>
@@ -1506,9 +1506,8 @@ var filter = '';
 var pinnedKey = null;   // focus : n'affiche que cette session
 var durAlertMin = 0;    // alerte si session > X min (0 = off)
 try{ durAlertMin = parseInt(localStorage.getItem('agentOfficeDurAlert')) || 0; }catch(e){}
-var iso3d = false;      // relief 2.5D (volume des bureaux + ombres)
-try{ iso3d = localStorage.getItem('agentOfficeIso') === '1'; }catch(e){}
-var spotlight = false;  // projecteur : la caméra suit l'agent actif
+var iso3d = false;      // vue isométrique — TOUJOURS 2D au chargement (pas de restauration auto)
+var spotlight = false;  // projecteur : la caméra suit l'agent actif — off au chargement
 function matchFilter(w){
   if(pinnedKey && workers[pinnedKey] && w.sid !== workers[pinnedKey].sid) return false;
   if(!filter) return true;
@@ -1547,7 +1546,7 @@ function TH(){
 }
 
 // ── jour / nuit ───────────────────────────────────────────────────────────────
-var nightState = 'auto';  // 'auto' | 'day' | 'night'
+var nightState = 'day';  // 'day' par défaut (plus d'auto-nuit) · 'auto' | 'night' via le bouton 🌗
 function isNight(){
   if(nightState==='night') return true;
   if(nightState==='day') return false;
@@ -2107,6 +2106,21 @@ function applyState(state){
 
   // workers dont la session/agent a disparu → ils partent
   for(var wk in workers){ if(!desired[wk]) workers[wk].mode = 'leave'; }
+
+  // ── anti-chevauchement GLOBAL : séparation par forces (aucune paire trop proche) ──
+  var arr = [];
+  for(var ck in workers){ var cw = workers[ck]; if(cw.mode!=='leave' && cw.home){ cw.home = { c: cw.home.c, r: cw.home.r }; arr.push(cw); } }  // clone (ne mute pas chaise/table)
+  var MIN = 1.0;  // distance mini entre 2 agents (en tuiles)
+  for(var it=0; it<12; it++){
+    for(var a=0; a<arr.length; a++) for(var b=a+1; b<arr.length; b++){
+      var A = arr[a].home, B = arr[b].home;
+      var dx = B.c-A.c, dy = B.r-A.r, d = Math.sqrt(dx*dx+dy*dy);
+      if(d >= MIN) continue;
+      if(d < 0.0001){ dx = ((a*7+b*13)%10)/10 - 0.5 + 0.01; dy = ((a*11+b*5)%10)/10 - 0.5 + 0.01; d = Math.sqrt(dx*dx+dy*dy) || 1; }  // exactement superposés → écart déterministe
+      var push = (MIN-d)/2, ux = dx/d, uy = dy/d;
+      A.c -= ux*push; A.r -= uy*push; B.c += ux*push; B.r += uy*push;
+    }
+  }
 
   // alertes + titre d'onglet (nb de sessions en alerte)
   var alerts = 0;
