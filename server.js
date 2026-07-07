@@ -17,18 +17,39 @@ const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
 
-let webhookUrl = process.env.WEBHOOK_URL || '';   // Slack/Discord/Teams…
-function notifyWebhook(text) {
-  if (!webhookUrl) return;
-  let u;
-  try { u = new URL(webhookUrl); } catch { return; }
-  const body = JSON.stringify({ text, content: text }); // Slack: text · Discord: content
+let webhookUrl = process.env.WEBHOOK_URL || '';   // webhook par défaut (Slack/Discord/Teams)
+// config des notifications (persistée)
+const notifCfg = {
+  events: { fail: true, taskDone: false, pipeline: true, session: true, approval: true, rules: true, subDone: false, stuck: true },
+  quietFrom: 0, quietTo: 0,   // heures silencieuses (from==to = désactivé)
+  role: '',                   // id de rôle Discord à pinguer sur erreur critique
+  digest: false,              // récap quotidien
+  projectHooks: {},           // projet -> url dédiée
+};
+function postTo(url, text) {
+  if (!url) return;
+  let u; try { u = new URL(url); } catch { return; }
+  const body = JSON.stringify({ text, content: text });
   const lib = u.protocol === 'http:' ? http : https;
   try {
     const rq = lib.request(u, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }, timeout: 4000 });
     rq.on('error', () => {}); rq.on('timeout', () => rq.destroy());
     rq.end(body);
   } catch { /* jamais bloquant */ }
+}
+function inQuiet() {
+  if (notifCfg.quietFrom === notifCfg.quietTo) return false;
+  const h = new Date().getHours(), f = notifCfg.quietFrom, t = notifCfg.quietTo;
+  return f < t ? (h >= f && h < t) : (h >= f || h < t);   // gère le passage minuit
+}
+function notifyWebhook(text) { postTo(webhookUrl, text); }   // brut (test de connexion)
+function notify(type, project, text, critical) {
+  if (!notifCfg.events[type]) return;      // type désactivé
+  if (inQuiet()) return;                    // heures silencieuses
+  const url = notifCfg.projectHooks[project] || webhookUrl;
+  if (!url) return;
+  if (critical && notifCfg.role) text = '<@&' + notifCfg.role + '> ' + text;
+  postTo(url, text);
 }
 
 const PORT = Number(process.env.PORT) || 4519;
@@ -81,10 +102,10 @@ function evalRules(session, ev, tool) {
       if (r.project && r.project !== '*' && !String(session.project).toLowerCase().includes(String(r.project).toLowerCase())) continue;
       let tf = 0; for (const a of Object.values(session.agents)) tf += a.fails || 0;
       session._firedErr = session._firedErr || {};
-      if (tf >= (r.n || 3) && !session._firedErr[i]) { session._firedErr[i] = 1; notifyWebhook('🚨 Règle : ' + session.project + ' a atteint ' + tf + ' erreurs'); }
+      if (tf >= (r.n || 3) && !session._firedErr[i]) { session._firedErr[i] = 1; notify('rules', session.project, '🚨 Règle : ' + session.project + ' a atteint ' + tf + ' erreurs', true); }
     } else if (r.type === 'file') {
       const fp = fileOf(ev, tool);
-      if (fp && r.text && String(fp).toLowerCase().includes(String(r.text).toLowerCase())) notifyWebhook('📌 Règle : ' + session.project + ' a modifié ' + shortPath(fp));
+      if (fp && r.text && String(fp).toLowerCase().includes(String(r.text).toLowerCase())) notify('rules', session.project, '📌 Règle : ' + session.project + ' a modifié ' + shortPath(fp));
     }
   }
 }
@@ -140,7 +161,7 @@ function scheduleSave() {
   saveTimer = setTimeout(() => {
     saveTimer = null;
     try {
-      const data = JSON.stringify({ sessions: [...sessions.values()], feed, stats, rules, webhookUrl });
+      const data = JSON.stringify({ sessions: [...sessions.values()], feed, stats, rules, webhookUrl, notifCfg });
       fs.writeFile(STATE_FILE, data, () => {});
     } catch { /* jamais bloquant */ }
   }, 1500);
@@ -161,6 +182,14 @@ function loadState() {
     }
     if (data && Array.isArray(data.rules)) rules = data.rules;
     if (data && data.webhookUrl && !webhookUrl) webhookUrl = data.webhookUrl;
+    if (data && data.notifCfg) {
+      if (data.notifCfg.events) Object.assign(notifCfg.events, data.notifCfg.events);
+      if ('quietFrom' in data.notifCfg) notifCfg.quietFrom = data.notifCfg.quietFrom;
+      if ('quietTo' in data.notifCfg) notifCfg.quietTo = data.notifCfg.quietTo;
+      if ('role' in data.notifCfg) notifCfg.role = data.notifCfg.role;
+      if ('digest' in data.notifCfg) notifCfg.digest = data.notifCfg.digest;
+      if (data.notifCfg.projectHooks) notifCfg.projectHooks = data.notifCfg.projectHooks;
+    }
     console.log(`état restauré : ${sessions.size} sessions`);
   } catch { /* pas de fichier / illisible : on démarre à vide */ }
 }
@@ -294,6 +323,7 @@ function handleEvent(ev, remoteAddr) {
   const sid = ev.session_id || ev.sessionId || 'unknown';
   const session = getSession(sid, ev);
   session.lastActivity = now();
+  session._stuck = 0;   // activité → plus bloqué
   if (remoteAddr && !session.host) {
     const ip = String(remoteAddr).replace('::ffff:', '');
     session.host = (ip === '127.0.0.1' || ip === '::1' || ip === 'localhost') ? 'local' : ip;
@@ -348,7 +378,7 @@ function handleEvent(ev, remoteAddr) {
       pushTick(agent, false, tool, detail);
       if (tool) { session.toolCounts[tool] = (session.toolCounts[tool] || 0) + 1; session.toolFails = session.toolFails || {}; session.toolFails[tool] = (session.toolFails[tool] || 0) + 1; }
       bumpStat(true);
-      notifyWebhook('❌ ' + session.project + ' : échec ' + (tool || '') + (detail ? ' — ' + detail : ''));
+      notify('fail', session.project, '❌ ' + session.project + ' : échec ' + (tool || '') + (detail ? ' — ' + detail : ''), true);
       break;
 
     case 'SubagentStart':
@@ -358,11 +388,11 @@ function handleEvent(ev, remoteAddr) {
     case 'SubagentStop': {
       agent.status = 'done';
       agent.currentTool = null;
-      notifyWebhook('🔻 ' + session.project + ' · sous-agent ' + (agent.type || '') + ' terminé');
+      notify('subDone', session.project, '🔻 ' + session.project + ' · sous-agent ' + (agent.type || '') + ' terminé');
       // pipeline terminé : plus aucun sous-agent actif
       const subsAll = Object.values(session.agents).filter(a => a.id !== 'main');
       if (subsAll.length && !subsAll.some(a => a.status === 'working')) {
-        notifyWebhook('🏁 ' + session.project + ' — pipeline terminé (' + subsAll.length + ' sous-agents)');
+        notify('pipeline', session.project, '🏁 ' + session.project + ' — pipeline terminé (' + subsAll.length + ' sous-agents)');
       }
       break;
     }
@@ -373,7 +403,7 @@ function handleEvent(ev, remoteAddr) {
         if (a.id === 'main') { a.status = 'idle'; a.currentTool = null; }
       }
       let acts = 0; for (const a of Object.values(session.agents)) acts += a.actions || 0;
-      notifyWebhook('✅ ' + session.project + ' — tâche terminée (' + acts + ' actions)');
+      notify('taskDone', session.project, '✅ ' + session.project + ' — tâche terminée (' + acts + ' actions)');
       break;
     }
 
@@ -385,7 +415,7 @@ function handleEvent(ev, remoteAddr) {
       for (const a of Object.values(session.agents)) { acts += a.actions || 0; fails += a.fails || 0; }
       const dur = Math.round((session.endedAt - session.startedAt) / 60000);
       session.summary = acts + ' actions · ' + fails + ' échecs · ' + dur + ' min';
-      notifyWebhook((fails ? '⚠️' : '✅') + ' ' + session.project + ' terminé — ' + session.summary);
+      notify('session', session.project, (fails ? '⚠️' : '✅') + ' ' + session.project + ' terminé — ' + session.summary, !!fails);
       break;
     }
 
@@ -393,7 +423,7 @@ function handleEvent(ev, remoteAddr) {
       // Claude attend une action de l'utilisateur (permission, idle…)
       agent.waiting = true;
       agent.notice = detail || ev.message || 'attend une action';
-      notifyWebhook('⏳ ' + session.project + ' attend une action : ' + agent.notice);
+      notify('approval', session.project, '⏳ ' + session.project + ' attend une action : ' + agent.notice, true);
       break;
 
     default:
@@ -428,6 +458,11 @@ function handleEvent(ev, remoteAddr) {
 function refreshStatuses() {
   const t = now();
   for (const [id, s] of sessions) {
+    // détection "bloqué" : inactif > 2 min alors qu'une tâche est en cours
+    if (s.status !== 'done' && !s._stuck && (t - s.lastActivity) > 120000) {
+      s._stuck = 1;
+      notify('stuck', s.project, '⚠️ ' + s.project + ' semble bloqué (aucune activité depuis 2 min)', true);
+    }
     if (s.status === 'working' && t - s.lastActivity > IDLE_MS) s.status = 'idle';
     // purge auto : session terminée depuis > 5 min, ou totalement inactive depuis > 30 min
     if ((s.status === 'done' && s.endedAt && t - s.endedAt > 5 * 60 * 1000) ||
@@ -448,6 +483,7 @@ function snapshot() {
     needApproval: [...needApproval],
     approvals: Object.values(pending).filter(p => !p.decision).map(p => ({ id: p.id, sid: p.sid, project: p.project, tool: p.tool, detail: p.detail })),
     webhook: !!webhookUrl,
+    notifCfg,
     rules,
     stats: { boot: bootStart, firstStart: stats.firstStart, now: now(), totalActions: stats.totalActions, hourly: hourlySeries(24), daily: dailySeries(105) },
   };
@@ -516,7 +552,7 @@ const server = http.createServer(async (req, res) => {
         const s = sessions.get(sid);
         const id = ++pendId;
         pending[id] = { id, sid, project: s ? s.project : sid, tool, detail: summarize(ev, 'PreToolUse', tool), decision: null, ts: now() };
-        notifyWebhook('🖐️ Approbation requise : ' + (s ? s.project : sid) + ' → ' + tool);
+        notify('approval', s ? s.project : sid, '🖐️ Approbation requise : ' + (s ? s.project : sid) + ' → ' + tool, true);
         resp = { decision: 'pending', id };
         broadcast();
       }
@@ -560,6 +596,24 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/rules') {
     const raw = await readBody(req);
     try { const b = JSON.parse(raw || '{}'); if (Array.isArray(b.rules)) rules = b.rules.slice(0, 50); } catch { /* ignore */ }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{}');
+    broadcast(); scheduleSave();
+    return;
+  }
+
+  // POST /notifcfg — réglages de notification
+  if (req.method === 'POST' && url.pathname === '/notifcfg') {
+    const raw = await readBody(req);
+    try {
+      const b = JSON.parse(raw || '{}');
+      if (b.events) Object.assign(notifCfg.events, b.events);
+      if ('quietFrom' in b) notifCfg.quietFrom = (b.quietFrom | 0);
+      if ('quietTo' in b) notifCfg.quietTo = (b.quietTo | 0);
+      if ('role' in b) notifCfg.role = String(b.role || '').replace(/[^0-9]/g, '');
+      if ('digest' in b) notifCfg.digest = !!b.digest;
+      if (b.projectHooks && typeof b.projectHooks === 'object') notifCfg.projectHooks = b.projectHooks;
+    } catch { /* ignore */ }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('{}');
     broadcast(); scheduleSave();
@@ -697,6 +751,24 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // PWA : manifest, service worker, icône
+  if (req.method === 'GET' && url.pathname === '/manifest.json') {
+    res.writeHead(200, { 'Content-Type': 'application/manifest+json' });
+    res.end(JSON.stringify({ name: 'agent-office', short_name: 'agent-office', start_url: '/', display: 'standalone',
+      background_color: '#0d1420', theme_color: '#0d1420', icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml' }] }));
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/sw.js') {
+    res.writeHead(200, { 'Content-Type': 'application/javascript' });
+    res.end("self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>self.clients.claim());self.addEventListener('fetch',function(){});");
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/icon.svg') {
+    res.writeHead(200, { 'Content-Type': 'image/svg+xml' });
+    res.end('<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192"><rect width="192" height="192" rx="28" fill="#0d1420"/><text x="96" y="128" font-size="110" text-anchor="middle">🏢</text></svg>');
+    return;
+  }
+
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('not found');
 });
@@ -710,7 +782,21 @@ server.listen(PORT, HOST, () => {
 });
 
 // Refresh périodique pour faire basculer working→idle même sans nouvel event.
-setInterval(() => { if (sseClients.size) broadcast(); }, 5000);
+setInterval(() => { broadcast(); }, 5000);
+
+// Récap quotidien (digest) envoyé une fois vers 20h si activé.
+let lastDigestDay = '';
+setInterval(() => {
+  if (!notifCfg.digest || !webhookUrl) return;
+  const d = new Date();
+  if (d.getHours() !== 20) return;
+  const day = dayKey(Date.now());
+  if (day === lastDigestDay) return;
+  lastDigestDay = day;
+  const acts = (stats.daily && stats.daily[day]) || 0;
+  let fails = 0; for (const s of sessions.values()) for (const a of Object.values(s.agents)) fails += a.fails || 0;
+  if (!inQuiet()) postTo(webhookUrl, '📊 Récap du jour — ' + acts + ' actions · ' + fails + ' erreurs · ' + sessions.size + ' sessions');
+}, 5 * 60 * 1000);
 
 // ─── UI : bureau virtuel (Canvas 2D, single-file) ────────────────────────────
 
@@ -719,6 +805,8 @@ const HTML = /* html */ `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0d1420">
+<link rel="manifest" href="/manifest.json">
 <title>agent-office</title>
 <style>
   :root{--bg:#0d1420;--line:#1e2735;--txt:#e6edf3;--dim:#8b98a9;--green:#3fb950;--amber:#ffb020;}
@@ -1165,6 +1253,24 @@ const HTML = /* html */ `<!DOCTYPE html>
     <input id="ruleFile" type="text" placeholder="fichier contient…" style="flex:1">
     <span class="cbtn2" id="ruleAddFile">+ fichier</span>
   </div>
+  <label>Notifications Discord — quoi envoyer</label>
+  <div id="ncEvents" style="display:flex;flex-wrap:wrap;gap:8px;font-size:12px;color:var(--dim)"></div>
+  <label>Heures silencieuses (de / à, 0–23 · égal = off)</label>
+  <div style="display:flex;gap:6px;align-items:center">
+    <input id="ncFrom" type="number" min="0" max="23" style="width:60px"> <span style="color:var(--dim)">→</span>
+    <input id="ncTo" type="number" min="0" max="23" style="width:60px">
+    <label style="margin:0 0 0 auto;display:flex;align-items:center;gap:5px;color:var(--dim)"><input id="ncDigest" type="checkbox"> digest 20h</label>
+  </div>
+  <label>Ping rôle Discord sur erreur (ID de rôle)</label>
+  <input id="ncRole" type="text" placeholder="ex: 123456789012345678">
+  <label>Webhook par projet (projet → url)</label>
+  <div id="ncHooks"></div>
+  <div style="display:flex;gap:6px;margin-top:6px">
+    <input id="ncProj" type="text" placeholder="projet" style="width:90px">
+    <input id="ncUrl" type="text" placeholder="url webhook" style="flex:1">
+    <span class="cbtn2" id="ncAddHook">+</span>
+  </div>
+  <span class="cbtn2" id="ncSave" style="margin-top:10px">💾 Enregistrer les notifs</span>
 </div>
 <div id="log"></div>
 <div id="replay">
@@ -1494,6 +1600,8 @@ function buzzError(){   // buzz grave distinct : erreur
 function softClick(){   // cliquetis de clavier discret (ambiance)
   beep('triangle', 1400, 0.02, 0.012, 0);
 }
+function dingDong(){ beep('sine', 880, 0.12, 0.06, 0); beep('sine', 660, 0.16, 0.06, 0.12); }  // approbation
+var lastApprovalCount = 0;
 function playSounds(state){
   var f = state.feed || [];
   if((soundOn || ambientOn) && actx){
@@ -1506,6 +1614,9 @@ function playSounds(state){
     }
   }
   if(f.length) lastSoundTs = Math.max(lastSoundTs, f[0].ts);
+  var apn = (state.approvals||[]).length;   // son distinct quand une approbation apparaît
+  if(soundOn && actx && apn > lastApprovalCount) dingDong();
+  lastApprovalCount = apn;
 }
 function deskIndexFor(sid){
   if(deskFor[sid] == null){ deskFor[sid] = nextDesk % desks.length; nextDesk++; }
@@ -2027,6 +2138,7 @@ function applyState(state){
   if(!replaying){
     document.getElementById('hookBtn').classList.toggle('on', !!state.webhook);
     if(state.rules){ rulesLocal = state.rules; if(document.getElementById('cfg').classList.contains('open')) renderRules(); }
+    if(state.notifCfg){ ncLocal = state.notifCfg; if(document.getElementById('cfg').classList.contains('open')) renderNotifCfg(); }
     updateNotif(state);  // centre de notifications (badge + panneau)
     checkNotifs();       // notifications navigateur
     playSounds(state);   // sons sur nouveaux events (si activés)
@@ -3027,7 +3139,7 @@ notifEl.querySelector('.nx').addEventListener('click', function(){ notifEl.class
 var cfgEl = document.getElementById('cfg');
 document.getElementById('cfgBtn').addEventListener('click', function(){
   var on = cfgEl.classList.toggle('open'); this.classList.toggle('on', on);
-  if(on){ document.getElementById('cfgDur').value = durAlertMin || 0; renderRules(); }
+  if(on){ document.getElementById('cfgDur').value = durAlertMin || 0; renderRules(); renderNotifCfg(); }
 });
 document.getElementById('cfgX').addEventListener('click', function(){ cfgEl.classList.remove('open'); document.getElementById('cfgBtn').classList.remove('on'); });
 document.getElementById('cfgHookSave').addEventListener('click', function(){
@@ -3057,6 +3169,39 @@ document.getElementById('ruleAddFile').addEventListener('click', function(){
 });
 document.getElementById('cfgRules').addEventListener('click', function(e){
   var b=e.target.closest('[data-ri]'); if(b){ rulesLocal.splice(parseInt(b.getAttribute('data-ri')),1); saveRules(); }
+});
+
+// ── config des notifications ──
+var NC_EVENTS = [['fail','échec'],['taskDone','tâche finie'],['pipeline','pipeline'],['session','session finie'],['approval','approbation'],['rules','règles'],['subDone','sous-agent'],['stuck','bloqué']];
+var ncLocal = { events:{}, quietFrom:0, quietTo:0, role:'', digest:false, projectHooks:{} };
+function renderNotifCfg(){
+  var ev = ncLocal.events || {};
+  document.getElementById('ncEvents').innerHTML = NC_EVENTS.map(function(e){
+    return '<label style="display:flex;align-items:center;gap:4px"><input type="checkbox" data-ev="'+e[0]+'" '+(ev[e[0]]?'checked':'')+'> '+e[1]+'</label>';
+  }).join('');
+  document.getElementById('ncFrom').value = ncLocal.quietFrom||0;
+  document.getElementById('ncTo').value = ncLocal.quietTo||0;
+  document.getElementById('ncRole').value = ncLocal.role||'';
+  document.getElementById('ncDigest').checked = !!ncLocal.digest;
+  var ph = ncLocal.projectHooks||{};
+  document.getElementById('ncHooks').innerHTML = Object.keys(ph).map(function(p){
+    return '<div style="display:flex;gap:6px;align-items:center;font-size:11px;color:var(--dim);margin:3px 0"><span style="flex:1">'+esc(p)+' → …'+esc(String(ph[p]).slice(-12))+'</span><span class="cbtn2" data-ph="'+esc(p)+'" style="padding:2px 7px">✕</span></div>';
+  }).join('') || '<div style="font-size:11px;color:#5c6b7e">Aucun.</div>';
+}
+function saveNotifCfg(){
+  var events = {}; document.querySelectorAll('#ncEvents [data-ev]').forEach(function(c){ events[c.getAttribute('data-ev')] = c.checked; });
+  var body = { events:events, quietFrom:parseInt(document.getElementById('ncFrom').value)||0, quietTo:parseInt(document.getElementById('ncTo').value)||0,
+    role:document.getElementById('ncRole').value.trim(), digest:document.getElementById('ncDigest').checked, projectHooks:ncLocal.projectHooks||{} };
+  ncLocal = body;
+  fetch('/notifcfg', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) }).catch(function(){});
+}
+document.getElementById('ncSave').addEventListener('click', saveNotifCfg);
+document.getElementById('ncAddHook').addEventListener('click', function(){
+  var p=document.getElementById('ncProj').value.trim(), u=document.getElementById('ncUrl').value.trim();
+  if(p&&u){ ncLocal.projectHooks = ncLocal.projectHooks||{}; ncLocal.projectHooks[p]=u; document.getElementById('ncProj').value=''; document.getElementById('ncUrl').value=''; renderNotifCfg(); saveNotifCfg(); }
+});
+document.getElementById('ncHooks').addEventListener('click', function(e){
+  var b=e.target.closest('[data-ph]'); if(b){ delete ncLocal.projectHooks[b.getAttribute('data-ph')]; renderNotifCfg(); saveNotifCfg(); }
 });
 
 // export d'un rapport Markdown de l'état courant
@@ -3225,6 +3370,7 @@ buildLayout();
 resize();
 connect();
 requestAnimationFrame(loop);
+if('serviceWorker' in navigator){ try{ navigator.serviceWorker.register('/sw.js'); }catch(e){} }
 })();
 </script>
 </body>
