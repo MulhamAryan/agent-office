@@ -140,7 +140,7 @@ function scheduleSave() {
   saveTimer = setTimeout(() => {
     saveTimer = null;
     try {
-      const data = JSON.stringify({ sessions: [...sessions.values()], feed, stats, rules });
+      const data = JSON.stringify({ sessions: [...sessions.values()], feed, stats, rules, webhookUrl });
       fs.writeFile(STATE_FILE, data, () => {});
     } catch { /* jamais bloquant */ }
   }, 1500);
@@ -160,6 +160,7 @@ function loadState() {
       stats.daily = data.stats.daily || {};
     }
     if (data && Array.isArray(data.rules)) rules = data.rules;
+    if (data && data.webhookUrl && !webhookUrl) webhookUrl = data.webhookUrl;
     console.log(`état restauré : ${sessions.size} sessions`);
   } catch { /* pas de fichier / illisible : on démarre à vide */ }
 }
@@ -354,17 +355,27 @@ function handleEvent(ev, remoteAddr) {
       agent.status = 'working';
       break;
 
-    case 'SubagentStop':
+    case 'SubagentStop': {
       agent.status = 'done';
       agent.currentTool = null;
+      notifyWebhook('🔻 ' + session.project + ' · sous-agent ' + (agent.type || '') + ' terminé');
+      // pipeline terminé : plus aucun sous-agent actif
+      const subsAll = Object.values(session.agents).filter(a => a.id !== 'main');
+      if (subsAll.length && !subsAll.some(a => a.status === 'working')) {
+        notifyWebhook('🏁 ' + session.project + ' — pipeline terminé (' + subsAll.length + ' sous-agents)');
+      }
       break;
+    }
 
-    case 'Stop':
+    case 'Stop': {
       session.status = 'idle';
       for (const a of Object.values(session.agents)) {
         if (a.id === 'main') { a.status = 'idle'; a.currentTool = null; }
       }
+      let acts = 0; for (const a of Object.values(session.agents)) acts += a.actions || 0;
+      notifyWebhook('✅ ' + session.project + ' — tâche terminée (' + acts + ' actions)');
       break;
+    }
 
     case 'SessionEnd': {
       session.status = 'done';
@@ -541,6 +552,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, set: !!webhookUrl }));
     broadcast();
+    scheduleSave();
     return;
   }
 
@@ -860,6 +872,13 @@ const HTML = /* html */ `<!DOCTYPE html>
   body.light #stats .hm{background:#dde5ef} body.light #stats .hm1{background:#a9dcbb}
   body.light #stats .hm2{background:#4bbf6f} body.light #stats .hm3{background:#2f9d4e}
 
+  /* rappel navigation */
+  #nav{position:absolute;right:12px;bottom:10px;z-index:6;pointer-events:none;font-size:10px;color:var(--dim);
+    background:rgba(10,16,26,.6);border:1px solid var(--line);border-radius:8px;padding:5px 9px}
+  #nav b{color:var(--txt)}
+  body.tv #nav{display:none}
+  body.light #nav{background:rgba(255,255,255,.7)}
+
   /* tooltip au survol */
   #tip{position:absolute;z-index:14;pointer-events:none;display:none;max-width:260px;
     background:rgba(10,16,26,.96);border:1px solid #26344c;border-radius:9px;padding:8px 10px;box-shadow:0 8px 24px rgba(0,0,0,.5)}
@@ -1099,7 +1118,8 @@ const HTML = /* html */ `<!DOCTYPE html>
     <span class="sbtn" id="listBtn" title="Vue liste compacte (m)">☰</span>
     <span class="sbtn" id="statsBtn" title="Statistiques (s)">📊</span>
     <span class="sbtn" id="radarBtn" title="Radar d'anomalies">📡</span>
-    <span class="sbtn" id="isoBtn" title="Relief 2.5D">🧊</span>
+    <span class="sbtn" id="isoBtn" title="Vue isométrique">🧊</span>
+    <span class="sbtn" id="rotBtn" title="Pivoter la vue iso (r)">🔄</span>
     <span class="sbtn" id="histBtn" title="Historique / recherche (h)">🕘</span>
     <span class="sbtn" id="replayBtn" title="Replay / remonter le temps">⏪</span>
     <span class="sbtn" id="ambBtn" title="Sons d'ambiance">🎧</span>
@@ -1153,6 +1173,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   <span id="rpTime">—</span>
   <span id="rpExit" title="Quitter le replay">✕ live</span>
 </div>
+<div id="nav">🖱️ molette : zoom · glisser : déplacer · double-clic : focus · <b>z</b> : recentrer</div>
 <div id="tip"></div>
 <div id="notif"></div>
 <div id="approve"></div>
@@ -1225,7 +1246,7 @@ function buildLayout(){
   decos.push({ t:'table', c:8,  r:11 });
   decos.push({ t:'table', c:9,  r:11 });
   BLOCK[key(8,11)] = 1; BLOCK[key(9,11)] = 1;
-  MEETING = { seats:[ {c:7,r:11},{c:10,r:11},{c:8,r:10},{c:9,r:10},{c:8,r:12},{c:9,r:12} ] };
+  MEETING = { cx:8.5, cy:11.3 };
 
   // positions de bureaux personnalisées (éditeur, persistées)
   var saved = loadDesks();
@@ -1246,7 +1267,7 @@ function buildLayout(){
 }
 function loadDesks(){ try{ return JSON.parse(localStorage.getItem('agentOfficeDesks')||'null'); }catch(e){ return null; } }
 function saveDesks(){ try{ localStorage.setItem('agentOfficeDesks', JSON.stringify(desks.map(function(d){ return {c:d.c,r:d.r}; }))); }catch(e){} }
-function cellAt(mx,my){ return { c:Math.floor((mx-OX)/TILE), r:Math.floor((my-OY)/TILE) }; }
+function cellAt(mx,my){ return toTile(mx,my); }
 function deskAt(mx,my){ var p = cellAt(mx,my); for(var i=0;i<desks.length;i++) if(desks[i].c===p.c && desks[i].r===p.r) return i; return -1; }
 function deskFree(c,r,except){
   if(c<1 || r<1 || c>=GW-1 || r>=GH-2) return false;               // garder la place de la chaise (r+1)
@@ -1268,6 +1289,14 @@ function moveDesk(idx,c,r){
 function pickAmenity(k){
   var h = 0; for(var i=0;i<k.length;i++) h = (h*31 + k.charCodeAt(i)) >>> 0;
   return AMENITIES[h % AMENITIES.length];
+}
+// place N sous-agents en cercle (ellipse) autour de la table ; idx<0 = le chef (centre-haut)
+function meetingSeat(idx, total){
+  if(idx < 0) return { c: MEETING.cx, r: MEETING.cy };   // le chef AU CENTRE
+  var n = Math.max(total, 1);
+  var ang = -Math.PI/2 + (idx / n) * Math.PI*2;
+  var rx = Math.min(6.5, 2.4 + n*0.22), ry = Math.min(1.9, 1.2 + n*0.07);   // rayon min → jamais au centre
+  return { c: MEETING.cx + Math.cos(ang)*rx, r: MEETING.cy + Math.sin(ang)*ry };
 }
 function blocked(c,r){ if(c<1||r<1||c>=GW-1||r>=GH) return true; return !!WALL[key(c,r)] || !!BLOCK[key(c,r)]; }
 function door(){ return { c: Math.floor(GW/2), r: GH-1 }; }
@@ -1482,15 +1511,15 @@ function deskIndexFor(sid){
   if(deskFor[sid] == null){ deskFor[sid] = nextDesk % desks.length; nextDesk++; }
   return deskFor[sid];
 }
-var SUB_OFFSETS = [ {dc:-1,dr:0}, {dc:1,dr:0}, {dc:-1,dr:1}, {dc:1,dr:1}, {dc:0,dr:1} ];
+var SUB_OFFSETS = [
+  {dc:-1,dr:0}, {dc:1,dr:0}, {dc:0,dr:1}, {dc:-1,dr:1}, {dc:1,dr:1},
+  {dc:-2,dr:0}, {dc:2,dr:0}, {dc:0,dr:2}, {dc:-2,dr:1}, {dc:2,dr:1},
+  {dc:-1,dr:2}, {dc:1,dr:2}, {dc:-2,dr:2}, {dc:2,dr:2}, {dc:-1,dr:-1}, {dc:1,dr:-1}
+];
 function subSpot(deskIdx, subIdx){
-  var chair = desks[deskIdx].chair, tries = 0;
-  for(var i=0;i<SUB_OFFSETS.length;i++){
-    var o = SUB_OFFSETS[(subIdx+i) % SUB_OFFSETS.length];
-    var c = chair.c + o.dc, r = chair.r + o.dr;
-    if(!blocked(c,r)) return {c:c, r:r};
-  }
-  return {c:chair.c, r:chair.r+1};
+  var chair = desks[deskIdx].chair;
+  var o = SUB_OFFSETS[subIdx % SUB_OFFSETS.length];   // offset DISTINCT par index → pas de chevauchement
+  return { c: chair.c + o.dc, r: chair.r + o.dr };
 }
 
 function makeWorker(k, pal, name, isMain){
@@ -1782,7 +1811,7 @@ document.getElementById('replayBtn').addEventListener('click', function(){ if(re
 
 // ── caméra (zoom sur un agent au double-clic) ─────────────────────────────────
 var cam = { s:1, fx:0, fy:0, ts:1, tfx:0, tfy:0, init:false };
-function officeCenter(){ return { x: OX + GW*TILE/2, y: OY + GH*TILE/2 }; }
+function officeCenter(){ return iso3d ? { x: px(GW/2-0.5, GH/2-0.5), y: py(GW/2-0.5, GH/2-0.5) } : { x: OX + GW*TILE/2, y: OY + GH*TILE/2 }; }
 function s2w(mx,my){ var sx = STW/2 - cam.fx*cam.s, sy = STH/2 - cam.fy*cam.s; return { x:(mx-sx)/cam.s, y:(my-sy)/cam.s }; }
 
 // ── confettis (célébration fin de session sans erreur) ────────────────────────
@@ -1834,7 +1863,7 @@ function updateRadar(){
 }
 function drawAnomMark(w, t){
   if(!w.anom || w.mode==='leave') return;
-  var x = px(w.fc) - TILE*0.26, y = py(w.fr) - TILE*0.58, s = 1 + 0.25*Math.abs(Math.sin(t*6));
+  var x = px(w.fc, w.fr) - TILE*0.26, y = py(w.fc, w.fr) - TILE*0.58, s = 1 + 0.25*Math.abs(Math.sin(t*6));
   ctx.font = Math.round(TILE*0.22*s) + 'px "Segoe UI",sans-serif';
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('📡', x, y);
 }
@@ -1875,12 +1904,12 @@ function applyState(state){
   var apBySid = {}; (state.approvals||[]).forEach(function(a){ apBySid[a.sid] = a; });
 
   // salle de réunion : la session avec le plus de sous-agents actifs (≥2) s'y installe
-  var meetingSid = null, maxSubs = 1;
+  var meetingSid = null, maxSubs = 1, meetingCount = 0;
   meetingName = '';
   for(var mI=0; mI<ordered.length; mI++){
     var ms = ordered[mI], cnt = 0, mags = ms.agents || {};
     for(var ma in mags){ if(ma!=='main' && mags[ma].status!=='done') cnt++; }
-    if(cnt > maxSubs){ maxSubs = cnt; meetingSid = ms.id; meetingName = ms.project || 'session'; }
+    if(cnt > maxSubs){ maxSubs = cnt; meetingSid = ms.id; meetingName = ms.project || 'session'; meetingCount = cnt; }
   }
 
   for(var s=0;s<ordered.length;s++){
@@ -1922,7 +1951,7 @@ function applyState(state){
       w.stale = (sess.status==='working' && (state.now - (sess.lastActivity||0)) > 45000);
       if(main) noteErr(w, main);
       w.deskChair = desks[di].chair;
-      w.home = (inMeeting && sess.status==='working') ? MEETING.seats[0] : desks[di].chair;
+      w.home = (inMeeting && sess.status==='working') ? meetingSeat(-1, meetingCount) : desks[di].chair;
       if(sess.status==='working'){ w.mode = 'work'; w.restSince = null; delete retired[sess.id]; }
       else if(sess.status==='idle'){ w.mode = 'relax'; w.restSince = null; delete retired[sess.id]; }
       else { // terminé : dort au lit un moment puis quitte le bureau
@@ -1959,7 +1988,7 @@ function applyState(state){
       sw.fails = a.fails || 0;
       sw.paused = (state.paused||[]).indexOf(sess.id) >= 0;
       noteErr(sw, a);
-      sw.home = inMeeting ? (MEETING.seats[(subIdx+1) % MEETING.seats.length]) : subSpot(di, subIdx);
+      sw.home = inMeeting ? meetingSeat(subIdx, meetingCount) : subSpot(di, subIdx);
       sw.mode = 'work';
       subIdx++;
     }
@@ -2056,7 +2085,7 @@ function update(dt, t){
   if(spotlight && !replaying){
     var tgt = (pinnedKey && workers[pinnedKey]) ? workers[pinnedKey] : null;
     if(!tgt){ for(var swk in workers){ if(workers[swk].tool){ tgt = workers[swk]; break; } } }
-    if(tgt){ cam.ts = 1.8; cam.tfx = px(tgt.fc); cam.tfy = py(tgt.fr); }
+    if(tgt){ cam.ts = 1.8; cam.tfx = px(tgt.fc, tgt.fr); cam.tfy = py(tgt.fc, tgt.fr); }
     else { cam.ts = 1; var oc = officeCenter(); cam.tfx = oc.x; cam.tfy = oc.y; }
   }
   // caméra : lerp doux vers la cible (zoom)
@@ -2072,40 +2101,76 @@ function update(dt, t){
 }
 
 // ── rendu ──────────────────────────────────────────────────────────────────────
-function px(fc){ return OX + (fc+0.5)*TILE; }
-function py(fr){ return OY + (fr+0.5)*TILE; }
+// ── projection : plat (par défaut) ou isométrique vrai (🧊) avec rotation (🔄) ──
+var IW = 0, IH = 0, ISOX = 0, ISOY = 0, isoRot = 0;   // isoRot ∈ {0,1,2,3} = 4 orientations
+function rotXYa(c, r, rot){
+  var cx = (GW-1)/2, cy = (GH-1)/2, x = c-cx, y = r-cy, a = rot*Math.PI/2, ca = Math.cos(a), sa = Math.sin(a);
+  return [ cx + x*ca - y*sa, cy + x*sa + y*ca ];
+}
+function RP(cc, rr){
+  if(!iso3d) return { x: OX + cc*TILE, y: OY + rr*TILE };
+  var p = rotXYa(cc, rr, isoRot); return { x: ISOX + (p[0]-p[1])*IW, y: ISOY + (p[0]+p[1])*IH };
+}
+function px(fc, fr){ if(!iso3d) return OX + (fc+0.5)*TILE; var p = rotXYa(fc+0.5, fr+0.5, isoRot); return ISOX + (p[0]-p[1])*IW; }
+function py(fc, fr){ if(!iso3d) return OY + (fr+0.5)*TILE; var p = rotXYa(fc+0.5, fr+0.5, isoRot); return ISOY + (p[0]+p[1])*IH; }
+function isoDepth(c, r){ var p = rotXYa(c, r, isoRot); return p[0] + p[1]; }   // tri profondeur (iso)
+function toTile(wx, wy){   // pixel (pré-caméra) → coord tuile
+  if(!iso3d) return { c: Math.floor((wx-OX)/TILE), r: Math.floor((wy-OY)/TILE) };
+  var X = (wx-ISOX)/IW, Y = (wy-ISOY)/IH, u = (X+Y)/2, v = (Y-X)/2;
+  var p = rotXYa(u, v, -isoRot);   // dé-rotation
+  return { c: Math.floor(p[0]), r: Math.floor(p[1]) };
+}
 function rr(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r);
   ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+// losange d'une tuile (iso) — 4 coins
+function tileDiamond(c, r){ var a=RP(c,r), b=RP(c+1,r), d=RP(c+1,r+1), e=RP(c,r+1);
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.lineTo(d.x,d.y); ctx.lineTo(e.x,e.y); ctx.closePath(); }
 
 function drawFloor(){
   var th = TH();
-  for(var c=0;c<GW;c++) for(var r=0;r<GH;r++){
-    var x = OX + c*TILE, y = OY + r*TILE;
-    if(WALL[key(c,r)]){
+  if(iso3d){
+    for(var c=0;c<GW;c++) for(var r=0;r<GH;r++){
+      tileDiamond(c,r);
+      if(WALL[key(c,r)]){ ctx.fillStyle = th.wall; ctx.fill(); ctx.strokeStyle = th.wallLo; ctx.lineWidth = 1; ctx.stroke(); }
+      else { ctx.fillStyle = ((c+r)%2===0) ? th.floorA : th.floorB; ctx.fill(); }
+    }
+    var d0 = door(); tileDiamond(d0.c, d0.r); ctx.fillStyle = th.mat; ctx.fill();
+    return;
+  }
+  for(var c2=0;c2<GW;c2++) for(var r2=0;r2<GH;r2++){
+    var x = OX + c2*TILE, y = OY + r2*TILE;
+    if(WALL[key(c2,r2)]){
       ctx.fillStyle = th.wall; ctx.fillRect(x,y,TILE,TILE);
       ctx.fillStyle = th.wallHi; ctx.fillRect(x,y,TILE,3);
       ctx.fillStyle = th.wallLo; ctx.fillRect(x,y+TILE-3,TILE,3);
     } else {
-      ctx.fillStyle = ((c+r)%2===0) ? th.floorA : th.floorB;
+      ctx.fillStyle = ((c2+r2)%2===0) ? th.floorA : th.floorB;
       ctx.fillRect(x,y,TILE,TILE);
     }
   }
-  // tapis d'entrée
   var d = door();
   ctx.fillStyle = th.mat;
   ctx.fillRect(OX+(d.c-0.5)*TILE, OY+(d.r-1)*TILE, TILE*2, TILE);
 }
 
 function drawDesk(dk){
-  var x = OX + dk.c*TILE, y = OY + dk.r*TILE, m = TILE*0.1;
-  // relief 2.5D : ombre portée + face avant (volume)
   if(iso3d){
-    var H = TILE*0.2;
-    ctx.fillStyle = 'rgba(0,0,0,.28)';
-    rr(x+m+3, y+m+H*0.6, TILE-2*m, TILE-2*m, 4); ctx.fill();       // ombre décalée
+    var H = IH*1.4;   // hauteur du bloc bureau
+    // face avant (volume) : coins bas du losange descendus de H
+    var b = RP(dk.c+1, dk.r), d = RP(dk.c+1, dk.r+1), e = RP(dk.c, dk.r+1);
     ctx.fillStyle = '#4a3220';
-    ctx.fillRect(x+m, y+TILE-m-H, TILE-2*m, H);                    // face avant (bois foncé)
+    ctx.beginPath(); ctx.moveTo(b.x,b.y); ctx.lineTo(d.x,d.y); ctx.lineTo(d.x,d.y+H); ctx.lineTo(b.x,b.y+H); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(d.x,d.y); ctx.lineTo(e.x,e.y); ctx.lineTo(e.x,e.y+H); ctx.lineTo(d.x,d.y+H); ctx.closePath(); ctx.fill();
+    // plateau (losange)
+    tileDiamond(dk.c, dk.r); ctx.fillStyle = '#7a5230'; ctx.fill();
+    tileDiamond(dk.c, dk.r); ctx.strokeStyle = '#8f6238'; ctx.lineWidth = 1; ctx.stroke();
+    // écran allumé/éteint au centre
+    var ce = px(dk.c, dk.r), cy2 = py(dk.c, dk.r);
+    ctx.fillStyle = deskActive(dk) ? '#2f81f7' : '#26313f';
+    ctx.fillRect(ce - IW*0.22, cy2 - IH*1.6, IW*0.44, IH*1.1);
+    return;
   }
+  var x = OX + dk.c*TILE, y = OY + dk.r*TILE, m = TILE*0.1;
   // plateau
   ctx.fillStyle = '#7a5230'; rr(x+m, y+m, TILE-2*m, TILE-2*m, 4); ctx.fill();
   ctx.fillStyle = '#8f6238'; ctx.fillRect(x+m, y+m, TILE-2*m, 4);
@@ -2127,6 +2192,14 @@ function deskActive(dk){
 }
 
 function drawDeco(dc){
+  if(iso3d){
+    var colr = {plant:'#2f8f4e',cooler:'#4cb3e0',water:'#4cb3e0',coffee:'#c0392b',gym:'#556072',bed:'#6f8fc0',shelf:'#5a3f28',couch:'#3a4b63',table:'#5a4630'}[dc.t] || '#556';
+    var H = IH*1.2, b = RP(dc.c+1,dc.r), d = RP(dc.c+1,dc.r+1);
+    ctx.fillStyle = 'rgba(0,0,0,.25)';
+    ctx.beginPath(); ctx.moveTo(b.x,b.y); ctx.lineTo(d.x,d.y); ctx.lineTo(d.x,d.y+H); ctx.lineTo(b.x,b.y+H); ctx.closePath(); ctx.fill();
+    tileDiamond(dc.c, dc.r); ctx.fillStyle = colr; ctx.fill();
+    return;
+  }
   var x = OX + dc.c*TILE, y = OY + dc.r*TILE;
   if(dc.t==='plant'){
     ctx.fillStyle='#5a3a24'; ctx.fillRect(x+TILE*0.34,y+TILE*0.55,TILE*0.32,TILE*0.3);
@@ -2162,7 +2235,7 @@ function drawDeco(dc){
 
 var RAIN_CH = '01ｱｳｴｶｷｸｹﾊﾋﾌ$#%&@';
 function drawWorker(w, t){
-  var x = px(w.fc), y = py(w.fr);
+  var x = px(w.fc, w.fr), y = py(w.fc, w.fr);
   var scale = Math.min(1, (t - w.spawn) / 0.4); // petite anim d'apparition
   var s = TILE * 0.5 * scale;
 
@@ -2283,7 +2356,7 @@ function drawWorker(w, t){
 }
 
 function drawTag(w){
-  var x = px(w.fc), y = py(w.fr) - TILE*0.62;
+  var x = px(w.fc, w.fr), y = py(w.fc, w.fr) - TILE*0.62;
   ctx.font = '600 11px "Segoe UI",system-ui,sans-serif';
   var label = w.name;
   var tw = ctx.measureText(label).width + 12;
@@ -2310,7 +2383,7 @@ function drawBubble(w, t){
   else return;
   if(!line1) return;
 
-  var x = px(w.fc), top = py(w.fr) - TILE*0.95;
+  var x = px(w.fc, w.fr), top = py(w.fc, w.fr) - TILE*0.95;
   ctx.font = '600 11px "Segoe UI",system-ui,sans-serif';
   var maxw = 190;
   line1 = fit(line1, maxw);
@@ -2338,7 +2411,7 @@ function drawBubble(w, t){
 // étiquette PERSISTANTE de la tâche (sur quoi il travaille) sous le perso
 function drawTask(w){
   if(!w.isMain || !w.task || w.mode==='leave') return;
-  var x = px(w.fc), y = py(w.fr) + TILE*0.6;
+  var x = px(w.fc, w.fr), y = py(w.fc, w.fr) + TILE*0.6;
   ctx.font = '11px "Segoe UI",system-ui,sans-serif';
   var label = fit(w.task, 200);
   var tw = ctx.measureText(label).width + 16;
@@ -2361,11 +2434,11 @@ function drawCollab(t){
   for(var sid in groups){
     var g = groups[sid];
     if(!g.main || !g.subs.length) continue;
-    var mx = px(g.main.fc), my = py(g.main.fr) - TILE*0.2;
+    var mx = px(g.main.fc, g.main.fr), my = py(g.main.fc, g.main.fr) - TILE*0.2;
     for(var i=0;i<g.subs.length;i++){
       var sub = g.subs[i];
       if(sub.mode==='leave') continue;
-      var sx = px(sub.fc), sy = py(sub.fr) - TILE*0.2;
+      var sx = px(sub.fc, sub.fr), sy = py(sub.fc, sub.fr) - TILE*0.2;
       // trait pointillé de communication
       ctx.strokeStyle = 'rgba(163,113,247,.55)'; ctx.lineWidth = 2;
       ctx.setLineDash([3,4]); ctx.lineDashOffset = -(t*14) % 7;
@@ -2383,9 +2456,8 @@ function drawCollab(t){
 // plaque de poste : nom du projet fixé au bureau (permanent, une seule fois)
 function drawDeskPlate(w){
   if(!w.isMain || !w.deskChair) return;
-  var cx = OX + (w.deskChair.c + 0.5)*TILE;
-  var deskTop = OY + (w.deskChair.r - 1)*TILE;
-  var y = deskTop - 17;
+  var cx = iso3d ? px(w.deskChair.c, w.deskChair.r-1) : OX + (w.deskChair.c + 0.5)*TILE;
+  var y = iso3d ? (py(w.deskChair.c, w.deskChair.r-1) - IH*3) : (OY + (w.deskChair.r - 1)*TILE - 17);
   ctx.font = '600 10px "Segoe UI",system-ui,sans-serif';
   var label = fit(w.name, TILE*1.7);
   var tw = Math.max(TILE*0.6, ctx.measureText(label).width + 10);
@@ -2406,8 +2478,8 @@ function drawDeskPlate(w){
 // plaque sur la table de réunion : nom du projet en réunion
 function drawMeetingLabel(){
   if(!meetingName || !MEETING) return;
-  var cx = OX + 9*TILE;                 // centre de la table (cases 8 et 9, r=11)
-  var y  = OY + 11*TILE - 6;
+  var cx = iso3d ? px(MEETING.cx, MEETING.cy-2) : OX + 9*TILE;
+  var y  = iso3d ? (py(MEETING.cx, MEETING.cy-2) - IH*2) : OY + 11*TILE - 6;
   ctx.font = '600 11px "Segoe UI",system-ui,sans-serif';
   var label = '🪑 ' + meetingName + ' — réunion';
   var tw = ctx.measureText(label).width + 14;
@@ -2421,7 +2493,7 @@ function drawMeetingLabel(){
 // label de type permanent sous un sous-agent (Explore, Plan…)
 function drawSubLabel(w){
   if(w.isMain || !w.type || w.mode==='leave') return;
-  var x = px(w.fc), y = py(w.fr) + TILE*0.5;
+  var x = px(w.fc, w.fr), y = py(w.fc, w.fr) + TILE*0.5;
   ctx.font = '600 9px "Segoe UI",system-ui,sans-serif';
   var label = (w.roleIcon||'') + ' ' + w.type;
   var tw = ctx.measureText(label).width + 8;
@@ -2441,7 +2513,7 @@ function drawBadge(w, t){
   else if(w.mode==='rest') ic = '💤';
   else if(w.mode==='relax' && w.amenity) ic = w.amenity.emoji;
   else return;
-  var x = px(w.fc), y = py(w.fr) - TILE*0.6;
+  var x = px(w.fc, w.fr), y = py(w.fc, w.fr) - TILE*0.6;
   var pulse = 1 + Math.sin(t*4)*0.06;
   ctx.fillStyle = 'rgba(8,12,20,.62)';
   ctx.beginPath(); ctx.arc(x, y, TILE*0.2*pulse, 0, 7); ctx.fill();
@@ -2453,7 +2525,7 @@ function drawBadge(w, t){
 // bulle d'erreur rouge quand un outil vient d'échouer
 function drawError(w, t){
   if(!w.errUntil || t > w.errUntil || w.mode==='leave') return;
-  var x = px(w.fc) + Math.sin(t*38)*2, y = py(w.fr) - TILE*0.95;
+  var x = px(w.fc, w.fr) + Math.sin(t*38)*2, y = py(w.fc, w.fr) - TILE*0.95;
   var txt = '💥 échec' + (w.errTool ? ' ' + w.errTool : '');
   ctx.font = '600 11px "Segoe UI",system-ui,sans-serif';
   var tw = ctx.measureText(txt).width + 14;
@@ -2468,7 +2540,7 @@ function drawError(w, t){
 function drawWaiting(w, t){
   if(!w.waiting || w.mode==='leave') return;
   var pulse = 0.6 + 0.4*Math.abs(Math.sin(t*3));
-  var x = px(w.fc), y = py(w.fr) - TILE*0.95;
+  var x = px(w.fc, w.fr), y = py(w.fc, w.fr) - TILE*0.95;
   ctx.save(); ctx.globalAlpha = pulse;
   var txt = '❓ attend';
   ctx.font = '600 11px "Segoe UI",system-ui,sans-serif';
@@ -2484,7 +2556,7 @@ function drawWaiting(w, t){
 // alerte "bloqué" : anneau rouge pulsant (aucune activité depuis longtemps)
 function drawStale(w, t){
   if(!w.stale || w.mode==='leave') return;
-  var x = px(w.fc), y = py(w.fr);
+  var x = px(w.fc, w.fr), y = py(w.fc, w.fr);
   var pulse = 0.4 + 0.5*Math.abs(Math.sin(t*3));
   ctx.save(); ctx.globalAlpha = pulse;
   ctx.strokeStyle = '#f85149'; ctx.lineWidth = 2.5;
@@ -2495,7 +2567,7 @@ function drawStale(w, t){
 // marqueur ⚠️ (boucle / échecs / attente) à côté de la tête
 function drawAlertMark(w, t){
   if(!w.alert || w.mode==='leave') return;
-  var x = px(w.fc) + TILE*0.26, y = py(w.fr) - TILE*0.58;
+  var x = px(w.fc, w.fr) + TILE*0.26, y = py(w.fc, w.fr) - TILE*0.58;
   var s = 0.9 + 0.15*Math.abs(Math.sin(t*5));
   ctx.font = Math.round(TILE*0.24*s) + 'px "Segoe UI",system-ui,sans-serif';
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
@@ -2505,7 +2577,7 @@ function drawAlertMark(w, t){
 // session en pause (kill-switch) : anneau cyan + ⏸
 function drawPaused(w, t){
   if(!w.paused || w.mode==='leave') return;
-  var x = px(w.fc), y = py(w.fr);
+  var x = px(w.fc, w.fr), y = py(w.fc, w.fr);
   ctx.save();
   ctx.strokeStyle = '#22b8c0'; ctx.lineWidth = 3; ctx.globalAlpha = 0.5 + 0.4*Math.abs(Math.sin(t*2.5));
   ctx.beginPath(); ctx.ellipse(x, y + TILE*0.1, TILE*0.46, TILE*0.54, 0, 0, 7); ctx.stroke();
@@ -2516,7 +2588,7 @@ function drawPaused(w, t){
 
 // anneau de surbrillance (survol / sélection)
 function drawRing(w, sel){
-  var x = px(w.fc), y = py(w.fr);
+  var x = px(w.fc, w.fr), y = py(w.fc, w.fr);
   ctx.strokeStyle = sel ? '#ffe08a' : 'rgba(255,255,255,.5)';
   ctx.lineWidth = sel ? 3 : 2;
   ctx.beginPath(); ctx.ellipse(x, y + TILE*0.1, TILE*0.42, TILE*0.5, 0, 0, 7); ctx.stroke();
@@ -2528,7 +2600,7 @@ function hitTest(mx, my){
   var best = null, bd = TILE*0.7;
   for(var wk in workers){
     var w = workers[wk];
-    var dx = mx - px(w.fc), dy = my - py(w.fr);
+    var dx = mx - px(w.fc, w.fr), dy = my - py(w.fc, w.fr);
     var d = Math.sqrt(dx*dx + dy*dy);
     if(d < bd){ bd = d; best = wk; }
   }
@@ -2639,14 +2711,32 @@ card.addEventListener('click', function(e){
 });
 
 // clic = inspecter un agent ; glisser un bureau = le déplacer (éditeur)
-var drag = null;
+var drag = null, pan = null;
+function stopSpot(){ if(spotlight){ spotlight=false; document.getElementById('spotBtn').classList.remove('on'); } }
+// molette = zoom (vers le curseur)
+cv.addEventListener('wheel', function(e){
+  e.preventDefault(); stopSpot();
+  var before = s2w(e.offsetX, e.offsetY);
+  var f = e.deltaY < 0 ? 1.15 : 0.87;
+  cam.s = cam.ts = Math.max(0.4, Math.min(5, cam.ts * f));
+  var after = s2w(e.offsetX, e.offsetY);   // garde le point sous le curseur fixe
+  cam.fx += before.x - after.x; cam.fy += before.y - after.y; cam.tfx = cam.fx; cam.tfy = cam.fy;
+}, { passive:false });
 cv.addEventListener('pointerdown', function(e){
   var wp = s2w(e.offsetX, e.offsetY);
   if(hitTest(wp.x, wp.y)) return;                    // sur un agent → sélection au relâchement
   var di = deskAt(wp.x, wp.y);
-  if(di >= 0){ drag = { idx:di, moved:false, ok:true, cell:{c:desks[di].c, r:desks[di].r} }; try{ cv.setPointerCapture(e.pointerId); }catch(x){} }
+  if(di >= 0){ drag = { idx:di, moved:false, ok:true, cell:{c:desks[di].c, r:desks[di].r} }; try{ cv.setPointerCapture(e.pointerId); }catch(x){} return; }
+  pan = { sx:e.offsetX, sy:e.offsetY, fx:cam.fx, fy:cam.fy, moved:false };   // glisser le fond = panoramique
+  stopSpot(); try{ cv.setPointerCapture(e.pointerId); }catch(x){}
 });
 cv.addEventListener('pointermove', function(e){
+  if(pan){
+    cam.fx = pan.fx - (e.offsetX - pan.sx)/cam.s; cam.fy = pan.fy - (e.offsetY - pan.sy)/cam.s;
+    cam.tfx = cam.fx; cam.tfy = cam.fy;
+    if(Math.abs(e.offsetX-pan.sx)+Math.abs(e.offsetY-pan.sy) > 3){ pan.moved = true; cv.classList.add('hot'); }
+    return;
+  }
   var wp = s2w(e.offsetX, e.offsetY);
   if(drag){
     var cell = cellAt(wp.x, wp.y);
@@ -2667,6 +2757,7 @@ cv.addEventListener('pointermove', function(e){
 });
 cv.addEventListener('pointerleave', function(){ document.getElementById('tip').classList.remove('show'); });
 cv.addEventListener('pointerup', function(e){
+  if(pan){ var pmoved = pan.moved; pan = null; cv.classList.remove('hot'); if(pmoved) return; }  // panoramique, pas de sélection
   if(drag){
     if(drag.moved && drag.ok) moveDesk(drag.idx, drag.cell.c, drag.cell.r);
     var moved = drag.moved; drag = null; cv.classList.remove('hot');
@@ -2681,7 +2772,7 @@ cv.addEventListener('pointerup', function(e){
 // double-clic : zoom caméra sur l'agent (ou dézoom sur le vide)
 cv.addEventListener('dblclick', function(e){
   var wp = s2w(e.offsetX, e.offsetY), k = hitTest(wp.x, wp.y);
-  if(k){ var w = workers[k]; cam.ts = 2.2; cam.tfx = px(w.fc); cam.tfy = py(w.fr); }
+  if(k){ var w = workers[k]; cam.ts = 2.2; cam.tfx = px(w.fc, w.fr); cam.tfy = py(w.fc, w.fr); }
   else { cam.ts = 1; var c = officeCenter(); cam.tfx = c.x; cam.tfy = c.y; }
 });
 document.addEventListener('keydown', function(e){
@@ -2697,6 +2788,7 @@ document.addEventListener('keydown', function(e){
   else if(k === 'm'){ document.getElementById('listBtn').click(); }
   else if(k === '/'){ e.preventDefault(); qInput.focus(); }
   else if(k === 'z'){ cam.ts = 1; var c = officeCenter(); cam.tfx = c.x; cam.tfy = c.y; }  // reset zoom
+  else if(k === 'r'){ rotateIso(e.shiftKey ? -1 : 1); }   // pivoter la vue iso
 });
 
 // panneau Équipe : toggle + clic sur une session → sélectionne son chef
@@ -2794,7 +2886,7 @@ function approve(id, d){ fetch('/approve', { method:'POST', headers:{'Content-Ty
 function w2s(wx, wy){ return { x: (STW/2 - cam.fx*cam.s) + wx*cam.s, y: (STH/2 - cam.fy*cam.s) + wy*cam.s }; }
 function drawApproval(w, t){   // petit marqueur clignotant au-dessus du perso
   if(!w.approvalReq) return;
-  var x = px(w.fc), y = py(w.fr) - TILE*0.6, s = 1 + 0.25*Math.abs(Math.sin(t*5));
+  var x = px(w.fc, w.fr), y = py(w.fc, w.fr) - TILE*0.6, s = 1 + 0.25*Math.abs(Math.sin(t*5));
   ctx.font = Math.round(TILE*0.3*s) + 'px "Segoe UI",sans-serif';
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('🖐️', x, y);
 }
@@ -2812,7 +2904,7 @@ function updateApprovalCards(){
       card.querySelector('.no').addEventListener('click', function(){ approve(id, 'deny'); });
       approveEl.appendChild(card);
     }
-    var sc = w2s(px(w.fc), py(w.fr) - TILE*0.9);
+    var sc = w2s(px(w.fc, w.fr), py(w.fc, w.fr) - TILE*0.9);
     card.style.left = sc.x + 'px'; card.style.top = sc.y + 'px';
   }
   // retire les cartes dont l'approbation n'existe plus
@@ -2874,10 +2966,20 @@ function runCommand(txt){
 }
 palInput.addEventListener('keydown', function(e){ if(e.key==='Enter') runCommand(palInput.value); else if(e.key==='Escape') closePalette(); });
 
-// relief 2.5D
+// vue isométrique
 (function(){ var b=document.getElementById('isoBtn'); b.classList.toggle('on', iso3d);
-  b.addEventListener('click', function(){ iso3d = !iso3d; b.classList.toggle('on', iso3d); try{ localStorage.setItem('agentOfficeIso', iso3d?'1':'0'); }catch(e){} });
+  b.addEventListener('click', function(){
+    iso3d = !iso3d; b.classList.toggle('on', iso3d);
+    try{ localStorage.setItem('agentOfficeIso', iso3d?'1':'0'); }catch(e){}
+    cam.ts = 1; resize(); cam.fx = cam.tfx; cam.fy = cam.tfy;   // recalcule la projection et recadre
+  });
 })();
+function rotateIso(dir){
+  if(!iso3d){ iso3d = true; document.getElementById('isoBtn').classList.add('on'); try{ localStorage.setItem('agentOfficeIso','1'); }catch(e){} }
+  isoRot = (isoRot + dir + 4) % 4;
+  cam.ts = 1; resize(); cam.fx = cam.tfx; cam.fy = cam.tfy;
+}
+document.getElementById('rotBtn').addEventListener('click', function(){ rotateIso(1); });
 
 // radar d'anomalies
 document.getElementById('radarBtn').addEventListener('click', function(){
@@ -3022,9 +3124,9 @@ function draw(t){
 
   // liste triée par profondeur (y) : bureaux, déco, workers
   var items = [];
-  for(var i=0;i<desks.length;i++) items.push({ y:(desks[i].r+1)*TILE, kind:'desk', o:desks[i] });
-  for(var j=0;j<decos.length;j++) items.push({ y:(decos[j].r+1)*TILE, kind:'deco', o:decos[j] });
-  for(var wk in workers){ var w = workers[wk]; items.push({ y:(w.fr+1)*TILE, kind:'worker', o:w }); }
+  for(var i=0;i<desks.length;i++) items.push({ y: iso3d?isoDepth(desks[i].c,desks[i].r):(desks[i].r+1)*TILE, kind:'desk', o:desks[i] });
+  for(var j=0;j<decos.length;j++) items.push({ y: iso3d?isoDepth(decos[j].c,decos[j].r):(decos[j].r+1)*TILE, kind:'deco', o:decos[j] });
+  for(var wk in workers){ var w = workers[wk]; items.push({ y: iso3d?isoDepth(w.fc,w.fr):(w.fr+1)*TILE, kind:'worker', o:w }); }
   items.sort(function(a,b){ return a.y - b.y; });
   for(var k=0;k<items.length;k++){
     var it = items[k];
@@ -3053,11 +3155,11 @@ function draw(t){
   if(selectedKey && workers[selectedKey]){ drawRing(workers[selectedKey], true); drawTag(workers[selectedKey]); }
   // aperçu de déplacement de bureau (éditeur)
   if(typeof drag !== 'undefined' && drag && drag.moved){
-    var gx = OX + drag.cell.c*TILE, gy = OY + drag.cell.r*TILE;
     ctx.save(); ctx.globalAlpha = 0.55;
     ctx.fillStyle = drag.ok ? 'rgba(63,185,80,.45)' : 'rgba(248,81,73,.45)';
-    ctx.fillRect(gx, gy, TILE, TILE);
-    ctx.strokeStyle = drag.ok ? '#3fb950' : '#f85149'; ctx.lineWidth = 2; ctx.strokeRect(gx, gy, TILE, TILE);
+    ctx.strokeStyle = drag.ok ? '#3fb950' : '#f85149'; ctx.lineWidth = 2;
+    if(iso3d){ tileDiamond(drag.cell.c, drag.cell.r); ctx.fill(); ctx.stroke(); }
+    else { var gx = OX + drag.cell.c*TILE, gy = OY + drag.cell.r*TILE; ctx.fillRect(gx, gy, TILE, TILE); ctx.strokeRect(gx, gy, TILE, TILE); }
     ctx.restore();
   }
   ctx.restore();  // fin caméra
@@ -3085,9 +3187,13 @@ function resize(){
   TILE = Math.floor(Math.min(STW/GW, STH/GH));
   OX = Math.floor((STW - TILE*GW)/2);
   OY = Math.floor((STH - TILE*GH)/2);
+  // params isométriques (losange 2:1)
+  IW = Math.min(STW / (GW+GH) * 0.98, STH / (GW+GH));
+  IH = IW * 0.5;
+  ISOX = 0; ISOY = 0;
   var c = officeCenter();
-  if(!cam.init){ cam.fx = cam.tfx = c.x; cam.fy = cam.tfy = c.y; cam.init = true; }
-  else if(cam.ts === 1){ cam.tfx = c.x; cam.tfy = c.y; }   // recadre si non zoomé
+  cam.tfx = c.x; cam.tfy = c.y;
+  if(!cam.init){ cam.fx = c.x; cam.fy = c.y; cam.init = true; }
 }
 window.addEventListener('resize', resize);
 
