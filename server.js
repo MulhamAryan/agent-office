@@ -16,6 +16,49 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
+// on masque le warning "SQLite is experimental" pour garder la console propre
+process.removeAllListeners('warning');
+process.on('warning', (w) => { if (!/SQLite is an experimental/.test(String(w && w.message))) console.warn(w); });
+const { DatabaseSync } = require('node:sqlite');
+
+const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'office.db');
+const db = new DatabaseSync(DB_FILE);
+db.exec('CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)');
+db.exec('CREATE TABLE IF NOT EXISTS journal(ts INTEGER, session TEXT, project TEXT, agent TEXT, agentType TEXT, kind TEXT, tool TEXT, detail TEXT, dff TEXT, ok INTEGER)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_j_ts ON journal(ts)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_j_session ON journal(session)');
+db.exec('CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, project TEXT, cwd TEXT, model TEXT, status TEXT, startedAt INTEGER, lastActivity INTEGER, endedAt INTEGER, host TEXT, transcriptPath TEXT, lastPrompt TEXT, summary TEXT, agents TEXT, toolCounts TEXT, toolFails TEXT, files TEXT)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_s_project ON sessions(project)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_s_status ON sessions(status)');
+const kvGetStmt = db.prepare('SELECT v FROM kv WHERE k=?');
+const kvSetStmt = db.prepare('INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v');
+const kvDelStmt = db.prepare('DELETE FROM kv WHERE k=?');
+const jInsStmt = db.prepare('INSERT INTO journal(ts,session,project,agent,agentType,kind,tool,detail,dff,ok) VALUES(?,?,?,?,?,?,?,?,?,?)');
+const sUpsertStmt = db.prepare('INSERT INTO sessions(id,project,cwd,model,status,startedAt,lastActivity,endedAt,host,transcriptPath,lastPrompt,summary,agents,toolCounts,toolFails,files) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET project=excluded.project,cwd=excluded.cwd,model=excluded.model,status=excluded.status,startedAt=excluded.startedAt,lastActivity=excluded.lastActivity,endedAt=excluded.endedAt,host=excluded.host,transcriptPath=excluded.transcriptPath,lastPrompt=excluded.lastPrompt,summary=excluded.summary,agents=excluded.agents,toolCounts=excluded.toolCounts,toolFails=excluded.toolFails,files=excluded.files');
+const sDelStmt = db.prepare('DELETE FROM sessions WHERE id=?');
+const sAllStmt = db.prepare('SELECT * FROM sessions');
+const sIdsStmt = db.prepare('SELECT id FROM sessions');
+function kvGet(k) { try { const r = kvGetStmt.get(k); return r ? JSON.parse(r.v) : null; } catch { return null; } }
+function kvSet(k, val) { try { kvSetStmt.run(k, JSON.stringify(val)); } catch { /* ignore */ } }
+function pj(s, d) { try { return s ? JSON.parse(s) : d; } catch { return d; } }
+function saveSessions() {
+  const ids = new Set();
+  for (const s of sessions.values()) {
+    ids.add(s.id);
+    sUpsertStmt.run(s.id, s.project || '', s.cwd || '', s.model || '', s.status || '', s.startedAt || 0, s.lastActivity || 0, s.endedAt || null,
+      s.host || '', s.transcriptPath || '', s.lastPrompt || '', s.summary || '',
+      JSON.stringify(s.agents || {}), JSON.stringify(s.toolCounts || {}), JSON.stringify(s.toolFails || {}), JSON.stringify(s.files || {}));
+  }
+  for (const r of sIdsStmt.all()) if (!ids.has(r.id)) sDelStmt.run(r.id);   // sessions disparues
+}
+function loadSessions() {
+  for (const r of sAllStmt.all()) {
+    sessions.set(r.id, { id: r.id, project: r.project, cwd: r.cwd, model: r.model, status: r.status,
+      startedAt: r.startedAt, lastActivity: r.lastActivity, endedAt: r.endedAt, host: r.host, transcriptPath: r.transcriptPath,
+      lastPrompt: r.lastPrompt, summary: r.summary,
+      agents: pj(r.agents, {}), toolCounts: pj(r.toolCounts, {}), toolFails: pj(r.toolFails, {}), files: pj(r.files, {}) });
+  }
+}
 
 let webhookUrl = process.env.WEBHOOK_URL || '';   // webhook par défaut (Slack/Discord/Teams)
 // config des notifications (persistée)
@@ -86,6 +129,14 @@ const MAX_FEED = 60;       // global event feed length
 const IDLE_MS = 90 * 1000; // after this with no activity → "idle"
 
 const feed = []; // global recent events {ts, session, agent, kind, tool, ok, project}
+const archive = []; // bibliothèque des sessions (pour reprise) {id, project, cwd, startedAt, endedAt, summary, prompt}
+function archiveSession(s) {
+  if (!s || !s.id) return;
+  const rec = { id: s.id, project: s.project, cwd: s.cwd || '', startedAt: s.startedAt, endedAt: s.endedAt || now(), summary: s.summary || '', prompt: s.lastPrompt || '' };
+  const i = archive.findIndex(a => a.id === s.id);
+  if (i >= 0) archive[i] = rec; else archive.unshift(rec);
+  if (archive.length > 100) archive.length = 100;
+}
 
 // ─── Contrôle (kill-switch / blocage d'outils) ───────────────────────────────
 const paused = new Set();   // sessionIds en pause (prochain outil bloqué)
@@ -160,38 +211,57 @@ function scheduleSave() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    try {
-      const data = JSON.stringify({ sessions: [...sessions.values()], feed, stats, rules, webhookUrl, notifCfg });
-      fs.writeFile(STATE_FILE, data, () => {});
-    } catch { /* jamais bloquant */ }
+    saveSessions();
+    kvSet('feed', feed);
+    kvSet('stats', stats);
+    kvSet('rules', rules);
+    kvSet('webhookUrl', webhookUrl);
+    kvSet('notifCfg', notifCfg);
+    kvSet('archive', archive);
   }, 1500);
 }
-function loadState() {
+function applyLoaded(data) {
+  if (Array.isArray(data.sessions)) for (const s of data.sessions) { if (s && s.id) sessions.set(s.id, s); }
+  if (Array.isArray(data.feed)) { feed.push(...data.feed); if (feed.length > MAX_FEED) feed.splice(0, feed.length - MAX_FEED); }
+  if (data.stats) { stats.firstStart = Math.min(stats.firstStart, data.stats.firstStart || stats.firstStart); stats.totalActions = data.stats.totalActions || 0; stats.hourly = data.stats.hourly || {}; stats.daily = data.stats.daily || {}; }
+  if (Array.isArray(data.rules)) rules = data.rules;
+  if (Array.isArray(data.archive)) { archive.push(...data.archive); if (archive.length > 100) archive.length = 100; }
+  if (data.webhookUrl && !webhookUrl) webhookUrl = data.webhookUrl;
+  if (data.notifCfg) {
+    if (data.notifCfg.events) Object.assign(notifCfg.events, data.notifCfg.events);
+    if ('quietFrom' in data.notifCfg) notifCfg.quietFrom = data.notifCfg.quietFrom;
+    if ('quietTo' in data.notifCfg) notifCfg.quietTo = data.notifCfg.quietTo;
+    if ('role' in data.notifCfg) notifCfg.role = data.notifCfg.role;
+    if ('digest' in data.notifCfg) notifCfg.digest = data.notifCfg.digest;
+    if (data.notifCfg.projectHooks) notifCfg.projectHooks = data.notifCfg.projectHooks;
+  }
+}
+// migration unique : ancien office-state.json + office-journal.jsonl → SQLite
+function migrateFromJson() {
   try {
-    const raw = fs.readFileSync(STATE_FILE, 'utf8');
-    const data = JSON.parse(raw);
-    if (data && Array.isArray(data.sessions)) {
-      for (const s of data.sessions) { if (s && s.id) sessions.set(s.id, s); }
-    }
-    if (data && Array.isArray(data.feed)) { feed.push(...data.feed); if (feed.length > MAX_FEED) feed.splice(0, feed.length - MAX_FEED); }
-    if (data && data.stats) {
-      stats.firstStart = Math.min(stats.firstStart, data.stats.firstStart || stats.firstStart);
-      stats.totalActions = data.stats.totalActions || 0;
-      stats.hourly = data.stats.hourly || {};
-      stats.daily = data.stats.daily || {};
-    }
-    if (data && Array.isArray(data.rules)) rules = data.rules;
-    if (data && data.webhookUrl && !webhookUrl) webhookUrl = data.webhookUrl;
-    if (data && data.notifCfg) {
-      if (data.notifCfg.events) Object.assign(notifCfg.events, data.notifCfg.events);
-      if ('quietFrom' in data.notifCfg) notifCfg.quietFrom = data.notifCfg.quietFrom;
-      if ('quietTo' in data.notifCfg) notifCfg.quietTo = data.notifCfg.quietTo;
-      if ('role' in data.notifCfg) notifCfg.role = data.notifCfg.role;
-      if ('digest' in data.notifCfg) notifCfg.digest = data.notifCfg.digest;
-      if (data.notifCfg.projectHooks) notifCfg.projectHooks = data.notifCfg.projectHooks;
-    }
-    console.log(`état restauré : ${sessions.size} sessions`);
-  } catch { /* pas de fichier / illisible : on démarre à vide */ }
+    const raw = fs.readFileSync(STATE_FILE, 'utf8'); const data = JSON.parse(raw);
+    for (const k of ['sessions', 'feed', 'stats', 'rules', 'webhookUrl', 'notifCfg', 'archive']) if (k in data) kvSet(k, data[k]);
+    console.log('migration JSON → SQLite (état)');
+  } catch { /* pas d'ancien fichier */ }
+  try {
+    const raw = fs.readFileSync(JOURNAL_FILE, 'utf8');
+    let n = 0;
+    for (const ln of raw.split('\n')) { if (!ln) continue; let e; try { e = JSON.parse(ln); } catch { continue; }
+      jInsStmt.run(e.ts || 0, e.session || '', e.project || '', e.agent || '', e.agentType || '', e.kind || '', e.tool || '', e.detail || '', e.diff ? JSON.stringify(e.diff) : null, e.ok === false ? 0 : 1); n++; }
+    if (n) console.log('migration JSONL → SQLite (' + n + ' events)');
+  } catch { /* pas d'ancien journal */ }
+}
+function loadState() {
+  const cnt = db.prepare('SELECT count(*) c FROM sessions').get().c;
+  if (!kvGet('stats') && cnt === 0) migrateFromJson();   // 1re fois : ancien JSON → kv + journal
+  // ancien blob kv['sessions'] → table normalisée (migration unique)
+  const blob = kvGet('sessions');
+  if (Array.isArray(blob)) { for (const s of blob) if (s && s.id) sessions.set(s.id, s); saveSessions(); try { kvDelStmt.run('sessions'); } catch { /* */ } }
+  else loadSessions();
+  const data = {};
+  for (const k of ['feed', 'stats', 'rules', 'webhookUrl', 'notifCfg', 'archive']) data[k] = kvGet(k);
+  applyLoaded(data);
+  console.log('SQLite : ' + sessions.size + ' sessions restaurées (table dédiée)');
 }
 
 function projectOf(cwd) {
@@ -415,6 +485,7 @@ function handleEvent(ev, remoteAddr) {
       for (const a of Object.values(session.agents)) { acts += a.actions || 0; fails += a.fails || 0; }
       const dur = Math.round((session.endedAt - session.startedAt) / 60000);
       session.summary = acts + ' actions · ' + fails + ' échecs · ' + dur + ' min';
+      archiveSession(session);
       notify('session', session.project, (fails ? '⚠️' : '✅') + ' ' + session.project + ' terminé — ' + session.summary, !!fails);
       break;
     }
@@ -444,10 +515,9 @@ function handleEvent(ev, remoteAddr) {
     ok: kind !== 'PostToolUseFailure',
   };
   pushFeed(entry);
-  // le journal (disque) porte en plus le diff des éditions
-  let journalEntry = entry;
-  if (kind === 'PostToolUse') { const df = diffOf(ev, tool); if (df) journalEntry = Object.assign({ diff: df }, entry); }
-  try { fs.appendFile(JOURNAL_FILE, JSON.stringify(journalEntry) + '\n', () => {}); } catch { /* jamais bloquant */ }
+  // journal en base (le diff des éditions est stocké dans la colonne dff)
+  const df = (kind === 'PostToolUse') ? diffOf(ev, tool) : null;
+  try { jInsStmt.run(entry.ts, entry.session, entry.project, entry.agent, entry.agentType, entry.kind, entry.tool || '', entry.detail || '', df ? JSON.stringify(df) : null, entry.ok ? 1 : 0); } catch { /* jamais bloquant */ }
 
   broadcast();
   scheduleSave();
@@ -467,6 +537,7 @@ function refreshStatuses() {
     // purge auto : session terminée depuis > 5 min, ou totalement inactive depuis > 30 min
     if ((s.status === 'done' && s.endedAt && t - s.endedAt > 5 * 60 * 1000) ||
         (t - s.lastActivity > 30 * 60 * 1000)) {
+      archiveSession(s);
       sessions.delete(id);
     }
   }
@@ -485,6 +556,7 @@ function snapshot() {
     webhook: !!webhookUrl,
     notifCfg,
     rules,
+    archive,
     stats: { boot: bootStart, firstStart: stats.firstStart, now: now(), totalActions: stats.totalActions, hourly: hourlySeries(24), daily: dailySeries(105) },
   };
 }
@@ -641,7 +713,7 @@ const server = http.createServer(async (req, res) => {
 
   // POST /prune — supprime les sessions non actives (terminées / inactives)
   if (req.method === 'POST' && url.pathname === '/prune') {
-    for (const [id, s] of sessions) { if (s.status !== 'working') sessions.delete(id); }
+    for (const [id, s] of sessions) { if (s.status !== 'working') { archiveSession(s); sessions.delete(id); } }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('{}');
     broadcast();
@@ -655,23 +727,13 @@ const server = http.createServer(async (req, res) => {
     const sid = qp.get('session') || '';
     const q = (qp.get('q') || '').toLowerCase();
     const limit = Math.min(2000, Number(qp.get('limit')) || 300);
-    let lines = [];
-    try {
-      let raw = fs.readFileSync(JOURNAL_FILE, 'utf8');
-      if (raw.length > 4 * 1024 * 1024) raw = raw.slice(raw.length - 4 * 1024 * 1024); // ne lit que la fin
-      lines = raw.split('\n');
-    } catch { /* pas de journal */ }
-    const out = [];
-    for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
-      const ln = lines[i]; if (!ln) continue;
-      let e; try { e = JSON.parse(ln); } catch { continue; }
-      if (sid && e.session !== sid) continue;
-      if (q) {
-        const hay = ((e.project || '') + ' ' + (e.tool || '') + ' ' + (e.detail || '') + ' ' + (e.kind || '')).toLowerCase();
-        if (hay.indexOf(q) < 0) continue;
-      }
-      out.push(e);
-    }
+    const cond = [], params = [];
+    if (sid) { cond.push('session = ?'); params.push(sid); }
+    if (q) { const l = '%' + q + '%'; cond.push('(lower(project) LIKE ? OR lower(tool) LIKE ? OR lower(detail) LIKE ? OR lower(kind) LIKE ?)'); params.push(l, l, l, l); }
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    let rows = [];
+    try { rows = db.prepare('SELECT * FROM journal ' + where + ' ORDER BY ts DESC LIMIT ?').all(...params, limit); } catch { /* ignore */ }
+    const out = rows.map(r => ({ ts: r.ts, session: r.session, project: r.project, agent: r.agent, agentType: r.agentType, kind: r.kind, tool: r.tool, detail: r.detail, diff: r.dff ? JSON.parse(r.dff) : undefined, ok: r.ok === 1 }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ events: out }));
     return;
@@ -1052,6 +1114,31 @@ const HTML = /* html */ `<!DOCTYPE html>
   body.light #palette{background:linear-gradient(180deg,#fff,#eef2f7);border-color:#8aa0bd}
   body.light #palette input{background:#fff;color:#1b2431;border-color:#c6d0dd}
 
+  /* bibliothèque de sessions (reprise) */
+  #lib{position:absolute;top:66px;left:50%;transform:translateX(-50%);width:min(680px,calc(100% - 32px));max-height:calc(100% - 90px);z-index:11;
+    background:linear-gradient(180deg,#141b28,#0e131c);border:1px solid #26344c;border-radius:14px;
+    box-shadow:0 18px 50px rgba(0,0,0,.6);display:none;flex-direction:column;overflow:hidden}
+  #lib.open{display:flex}
+  #lib h3{font-size:12px;margin:0;padding:12px 14px;border-bottom:1px solid var(--line);color:var(--dim);text-transform:uppercase;letter-spacing:1px;display:flex}
+  #lib h3 .lx{margin-left:auto;cursor:pointer}
+  #lib .lb{overflow:auto;padding:8px}
+  #lib .li{border:1px solid #1a2434;border-radius:10px;padding:9px 11px;margin:6px 0;background:#0d131d}
+  #lib .li .lh{display:flex;align-items:center;gap:8px;font-size:13px}
+  #lib .li .lp{font-weight:600;color:var(--txt)}
+  #lib .li .lst{margin-left:auto;font-size:10px;color:var(--dim)}
+  #lib .li .lcwd{font-family:"Consolas",monospace;font-size:11px;color:var(--dim);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #lib .li .lsum{font-size:11px;color:#9fb0c4;margin-top:3px}
+  #lib .li .lact{display:flex;gap:6px;margin-top:8px}
+  #lib .li .lbtn{cursor:pointer;font-size:11px;padding:5px 9px;border-radius:7px;border:1px solid #26344c;background:#0e131c;color:var(--txt)}
+  #lib .li .lbtn:hover{border-color:#3a4c6b}
+  #lib .li .lbtn.go{border-color:#1f7a3a;color:#3fb950}
+  body.light #lib{background:linear-gradient(180deg,#fff,#eef2f7);border-color:#c6d0dd}
+  body.light #lib .li{background:#f1f4f9;border-color:#d6dee9}
+  body.light #lib .li .lbtn{background:#fff;border-color:#c6d0dd;color:#1b2431}
+  body.light #lib .li .lbtn:hover{border-color:#8aa0bd}
+  body.light #lib .li .lbtn.go{color:#1f9d4d;border-color:#a9dcbb;background:#eaf7ee}
+  body.light #lib .li .lcwd{color:#5a6b7e} body.light #lib .li .lsum{color:#3a5266}
+
   /* radar d'anomalies */
   #radar{position:absolute;top:66px;left:50%;transform:translateX(-50%);width:min(560px,calc(100% - 32px));z-index:9;
     background:linear-gradient(180deg,#141b28,#0e131c);border:1px solid #26344c;border-radius:14px;
@@ -1208,6 +1295,7 @@ const HTML = /* html */ `<!DOCTYPE html>
     <span class="sbtn" id="radarBtn" title="Radar d'anomalies">📡</span>
     <span class="sbtn" id="isoBtn" title="Vue isométrique">🧊</span>
     <span class="sbtn" id="rotBtn" title="Pivoter la vue iso (r)">🔄</span>
+    <span class="sbtn" id="libBtn" title="Bibliothèque de sessions / reprise">📚</span>
     <span class="sbtn" id="histBtn" title="Historique / recherche (h)">🕘</span>
     <span class="sbtn" id="replayBtn" title="Replay / remonter le temps">⏪</span>
     <span class="sbtn" id="ambBtn" title="Sons d'ambiance">🎧</span>
@@ -1230,6 +1318,7 @@ const HTML = /* html */ `<!DOCTYPE html>
 <div id="list"></div>
 <div id="stats"></div>
 <div id="radar"></div>
+<div id="lib"></div>
 <div id="hist">
   <div id="histHead"><input id="histQ" type="text" placeholder="🔎 rechercher (fichier, outil, texte…)" autocomplete="off"><span id="histTitle"></span><span id="histX" title="Fermer">✕</span></div>
   <div id="histBody"></div>
@@ -1738,6 +1827,39 @@ function checkNotifs(){
   }
 }
 
+// ── bibliothèque de sessions (reprise / mémoire locale) ──────────────────────
+var libEl = document.getElementById('lib'), _libHtml = '';
+function updateLib(state){
+  if(!libEl.classList.contains('open')) return;
+  var seen = {}, list = [];
+  (state.sessions||[]).forEach(function(s){ seen[s.id]=1; list.push({ id:s.id, project:s.project, cwd:s.cwd||'', when:s.startedAt, status:s.status, summary:s.summary||'', prompt:s.lastPrompt||'' }); });
+  (state.archive||[]).forEach(function(a){ if(!seen[a.id]) list.push({ id:a.id, project:a.project, cwd:a.cwd||'', when:a.endedAt||a.startedAt, status:'archivée', summary:a.summary||'', prompt:a.prompt||'' }); });
+  list.sort(function(a,b){ return (b.when||0)-(a.when||0); });
+  var rows = list.map(function(s){
+    return '<div class="li"><div class="lh"><span class="dot" style="width:8px;height:8px;border-radius:50%;background:'+palOf(s.project||s.id).sh+'"></span>'
+      + '<span class="lp">'+esc(s.project||'session')+'</span><span class="lst">'+esc(s.status)+' · '+(s.when?fmtT(s.when):'')+'</span></div>'
+      + (s.cwd?'<div class="lcwd">'+esc(s.cwd)+'</div>':'')
+      + (s.prompt||s.summary?'<div class="lsum">'+esc(s.prompt||s.summary)+'</div>':'')
+      + '<div class="lact"><span class="lbtn go" data-resume="'+esc(s.id)+'" data-cwd="'+esc(s.cwd)+'">⤴ Reprendre</span>'
+      + '<span class="lbtn" data-lhist="'+esc(s.id)+'" data-lname="'+esc(s.project)+'">🕘 Historique</span></div></div>';
+  }).join('') || '<div style="padding:16px;color:#5c6b7e">Aucune session mémorisée.</div>';
+  var html = '<h3>📚 Sessions <span class="lx">✕</span></h3><div class="lb">'+rows+'</div>';
+  if(html!==_libHtml){ _libHtml=html; libEl.innerHTML=html; }
+}
+document.getElementById('libBtn').addEventListener('click', function(){ var on=libEl.classList.toggle('open'); this.classList.toggle('on',on); if(on&&lastData){ _libHtml=''; updateLib(lastData); } });
+libEl.addEventListener('click', function(e){
+  if(e.target.closest('.lx')){ libEl.classList.remove('open'); document.getElementById('libBtn').classList.remove('on'); return; }
+  var g = e.target.closest('[data-resume]');
+  if(g){ var id=g.getAttribute('data-resume'), cwd=g.getAttribute('data-cwd');
+    var cmd = (cwd? 'cd "'+cwd+'" ; ' : '') + 'claude --resume ' + id;
+    try{ navigator.clipboard.writeText(cmd); }catch(x){}
+    var old=g.textContent; g.textContent='✓ commande copiée'; setTimeout(function(){ g.textContent=old; }, 1600);
+    return;
+  }
+  var h = e.target.closest('[data-lhist]');
+  if(h){ openHist(h.getAttribute('data-lhist'), h.getAttribute('data-lname')); }
+});
+
 // ── vue liste compacte ────────────────────────────────────────────────────────
 var listEl = document.getElementById('list');
 var _listHtml = '';
@@ -2148,6 +2270,7 @@ function applyState(state){
   updateLog(state);    // mini-log d'activité
   updateTeam(state);   // panneau Équipe
   updateList(state);   // vue liste compacte
+  updateLib(state);    // bibliothèque de sessions
   updateStats(state);  // panneau statistiques
   if(!replaying){
     document.getElementById('hookBtn').classList.toggle('on', !!state.webhook);
@@ -2905,7 +3028,7 @@ document.addEventListener('keydown', function(e){
   if((e.ctrlKey||e.metaKey) && (e.key||'').toLowerCase()==='k'){ e.preventDefault(); openPalette(); return; }
   if(e.target && e.target.tagName === 'INPUT') return;
   var k = (e.key||'').toLowerCase();
-  if(e.key === 'Escape'){ selectedKey=null; card.classList.remove('open'); _cardHtml=''; listEl.classList.remove('open'); statsEl.classList.remove('open'); histEl.classList.remove('open'); radarEl.classList.remove('open'); document.getElementById('cfg').classList.remove('open'); convoEl.classList.remove('open'); notifEl.classList.remove('open'); if(lastData) updateLog(lastData); return; }
+  if(e.key === 'Escape'){ selectedKey=null; card.classList.remove('open'); _cardHtml=''; listEl.classList.remove('open'); statsEl.classList.remove('open'); histEl.classList.remove('open'); radarEl.classList.remove('open'); document.getElementById('cfg').classList.remove('open'); convoEl.classList.remove('open'); notifEl.classList.remove('open'); libEl.classList.remove('open'); if(lastData) updateLog(lastData); return; }
   if(k === 'f'){ toggleTV(); }
   else if(k === 's'){ document.getElementById('statsBtn').click(); }
   else if(k === 'h'){ document.getElementById('histBtn').click(); }

@@ -1,6 +1,10 @@
 node_modules/
 office-state.json
 office-journal.jsonl
+office.db
+office.db-journal
+office.db-wal
+office.db-shm
 *.log
 .DS_Store
 Thumbs.db
