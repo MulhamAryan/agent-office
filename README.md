@@ -1,10 +1,10 @@
 # 🏢 agent-office
 
-Un **bureau virtuel live** qui transforme tes sessions Claude Code en un petit jeu de gestion vu de dessus : chaque session devient un personnage qui arrive au bureau, s'assoit, tape au clavier, cherche dans des fichiers, collabore avec ses sous-agents, va boire un café ou dormir quand il a fini. Le tout avec **surveillance, contrôle, statistiques, replay et alertes**.
+Un **bureau virtuel live** qui transforme tes sessions Claude Code en un petit jeu de gestion vu de dessus : chaque session devient un personnage qui arrive, s'assoit, tape au clavier, cherche dans des fichiers, collabore avec ses sous-agents, va boire un café ou dormir quand il a fini. Avec **surveillance, contrôle (human-in-the-loop), statistiques, replay, radar d'anomalies, notifications Discord, vue isométrique** et une **bibliothèque de sessions** pour reprendre un travail.
 
-Zéro dépendance, **un seul fichier** (`server.js`), Node ≥ 18. Rendu **Canvas 2D** à 60 fps, données temps réel via **SSE**.
+**Un seul fichier** (`server.js`), **zéro dépendance npm**, Node ≥ 22 (utilise le module intégré `node:sqlite`). Rendu **Canvas 2D** à 60 fps, temps réel via **SSE**, persistance **SQLite**.
 
-![node](https://img.shields.io/badge/node-%E2%89%A518-3fb950) ![deps](https://img.shields.io/badge/dependencies-0-4c9aff)
+![node](https://img.shields.io/badge/node-%E2%89%A522-3fb950) ![deps](https://img.shields.io/badge/npm%20deps-0-4c9aff) ![db](https://img.shields.io/badge/db-SQLite-blue)
 
 ---
 
@@ -15,11 +15,11 @@ node server.js            # → http://localhost:4519
 PORT=8080 node server.js  # port personnalisé
 ```
 
-Variables d'env optionnelles : `PORT`, `HOST`, `WEBHOOK_URL` (Slack/Discord), `STATE_FILE`, `JOURNAL_FILE`.
+Env optionnelles : `PORT`, `HOST`, `WEBHOOK_URL` (Discord/Slack), `DB_FILE`.
 
 ## 🔌 Brancher les hooks Claude Code
 
-Le serveur reçoit les événements des hooks en `POST http://localhost:4519/event`. Dans `~/.claude/settings.json` :
+`POST http://localhost:4519/event`. Dans `~/.claude/settings.json` :
 
 ```json
 {
@@ -38,7 +38,7 @@ Le serveur reçoit les événements des hooks en `POST http://localhost:4519/eve
 }
 ```
 
-**Contrôle (pause / blocage / approbation)** — nécessite en plus un hook `PreToolUse` de type `command` pointant sur `hooks/gate.ps1` (voir la section Contrôle) :
+**Contrôle (Pause / Blocage / Approbation)** — ajoute un hook `PreToolUse` de type `command` sur `hooks/gate.ps1` :
 
 ```json
 "PreToolUse": [{ "matcher": "*", "hooks": [
@@ -47,89 +47,76 @@ Le serveur reçoit les événements des hooks en `POST http://localhost:4519/eve
 ]}]
 ```
 
-**Mode équipe / multi-machine** : sur les autres machines, pointe les hooks vers `http://<ip-du-serveur>:4519/event`. Chaque session est étiquetée par son IP source (🖥️).
+**Mode équipe** : sur d'autres machines, pointe les hooks vers `http://<ip-serveur>:4519/event` — chaque session est étiquetée par son IP (🖥️).
 
 ---
 
 ## 🧑‍💻 Le bureau
+- 1 personnage par agent (couleur par projet) qui se **téléporte** à un bureau libre.
+- Animations selon l'outil : tape (Bash/Edit/Write), lit (Read/Grep), réfléchit 💭.
+- **Rôles de sous-agents** : 🔭 Explore · 🗺️ Plan · 🔍 review · 🛡️ security · 🧪 test · 📚 doc · 🐛 debug.
+- **Salle de réunion** (workflows ≥ 2 sous-agents) : cercle dynamique autour d'une table.
+- **Coin détente** : ☕ / 🏃 / 😌 / 💧 en pause ; 💤 lit puis départ quand terminé.
+- **Anti-chevauchement** par séparation de forces (aucun agent superposé).
+- **Vue isométrique** 🧊 (sol en losanges, volumes), **rotation** 🔄 (touche `r`), **relief 3D**.
+- **Humeur** (calme / effervescent / 🔥), **jour/nuit** ☀️🌙, **thème clair/sombre** 🌓.
 
-- **Un personnage par agent** (couleur unique par projet) qui **se téléporte** à un bureau libre.
-- **Animations selon l'outil** : tape (Bash/Edit/Write), lit (Read/Grep/Search), réfléchit 💭.
-- **Rôles de sous-agents** par icône/couleur : 🔭 Explore · 🗺️ Plan · 🔍 review · 🛡️ security · 🧪 test · 📚 doc · 🐛 debug.
-- **Plaque de bureau** : projet + durée + nombre d'actions. **Badge d'activité** au-dessus de la tête.
-- **Salle de réunion** : quand une session lance ≥ 2 sous-agents, l'équipe se rassemble autour d'une table (nom du projet affiché).
-- **Coin détente** : en pause → ☕ café / 🏃 sport / 😌 canapé / 💧 fontaine ; terminé → 💤 lit puis départ.
-- **Discussion** : traits animés + 💬 entre chef et sous-agents. **Confettis** 🎉 à une fin sans erreur.
-- **Humeur du bureau** : ambiance visuelle calme / effervescente (ambre) / en feu 🔥 (rouge) selon activité et erreurs.
-- **Relief 2.5D** (🧊) et **jour/nuit** (🌗, avec lampes de bureau) et **thème clair/sombre** (🌓).
+## 🧭 Navigation
+Molette = zoom · glisser = déplacer · double-clic sur un agent = focus · **`z`** = recentrer · 🎯 = projecteur auto.
 
 ## 🔍 Surveillance
+Alertes ⚠️ (boucle, échecs en série, attente, inactivité, durée dépassée) · **Radar d'anomalies** 📡 (vs baseline) · **Centre de notifications** 🛎️ · titre d'onglet `(2⚠)` · tooltip au survol · badges d'activité.
 
-- **Alertes** ⚠️ : boucle d'outil, échecs en série, attente de permission longue, inactivité, **durée dépassée** (seuil configurable).
-- **Radar d'anomalies** 📡 : détection **vs baseline** (taux d'erreur anormal, session figée) — le bouton rougeoie s'il y a une anomalie.
-- **Bulle d'erreur** 💥 · **attente** ❓ · **anneau rouge** (figé) · **📡** (anomalie).
-- **Centre de notifications** 🛎️ : historique des événements importants + pastille de compteur.
-- **Titre d'onglet** dynamique : `(2⚠) agent-office` pour voir les alertes en arrière-plan.
-- **Aperçu au survol** : passe la souris sur un perso → tooltip (projet, tâche, action).
-- **Projecteur** 🎯 : la caméra suit automatiquement l'agent actif.
-
-## 🖱️ Clic sur un agent (panneau détail)
-
-Tâche en cours · action réelle · **historique d'outils** (pulse-lane) · **sparkline** d'activité · **fichiers travaillés** (liens `vscode://` pour ouvrir) · **métriques par outil** + taux d'échec · **coéquipiers** (cliquables) · boutons de contrôle · **💬 Conversation** (prose de l'agent lue dans le transcript) · **🔎 Sous-agents** (activité réelle des sous-agents extraite des sidechains du transcript).
+## 🖱️ Clic sur un agent
+Tâche · action réelle · **historique d'outils** · **sparkline** · **fichiers travaillés** (liens `vscode://`) · **métriques par outil** + taux d'échec · **coéquipiers cliquables** · **💬 Conversation** (transcript) · **🔎 Sous-agents** (activité extraite des sidechains) · contrôle.
 
 ## 🎛️ Contrôle (human-in-the-loop)
+Via `hooks/gate.ps1` (fail-open) : **⏸ Pause**, **🚫 Bloquer un outil**, **🖐️ Exiger OK** (l'agent attend ; une carte apparaît près de lui avec la commande + **✅/⛔**).
 
-Via le hook `hooks/gate.ps1` (interroge le serveur avant chaque outil, **fail-open** si serveur down) :
+## 📈 Statistiques 📊
+Uptime · total actions · **histogramme horaire** · **Gantt** · **classement projets** · **score & badges** · **heatmap calendrier**.
 
-- **⏸ Pause / ▶ Reprendre** une session.
-- **🚫 Bloquer** un outil précis.
-- **🖐️ Exiger OK (approbation)** : l'agent **attend** sur les outils sensibles (Bash/Write/Edit/PowerShell/Notebook) ; une **carte apparaît près du perso** avec la commande exacte et **✅ Autoriser / ⛔ Refuser** — l'agent reprend ou est refusé.
+## 🕘 Historique & ⏪ Replay
+Journal SQL persistant + **recherche** + **diff des éditions** · **Replay** : rejoue le bureau à n'importe quel instant (scrub) ou en ×60.
 
-## 📈 Statistiques (📊, persistantes)
+## 📚 Bibliothèque de sessions (reprise)
+Mémoire locale de toutes tes sessions (actives + archivées). Bouton **⤴ Reprendre** → copie `cd "<cwd>" ; claude --resume <id>` à coller dans le terminal du projet. **🕘 Historique** par session.
 
-Uptime · 1er lancement · total actions · **histogramme horaire** · **Gantt** des sessions · **classement projets** · **score & achievements** (séries de jours, badges) · **heatmap calendrier** (~15 semaines).
-
-## 🕘 Historique & Replay
-
-- **Historique** 🕘 : journal persistant (`office-journal.jsonl`), **recherche** plein-texte, **diff des éditions** (déplie old/new).
-- **Replay** ⏪ : barre temporelle pour **rejouer le bureau à n'importe quel instant** passé (scrub) ou en **accéléré ×60**.
-
-## 🔔 Alertes & règles
-
-- **Webhook** Slack/Discord/Teams (🔔 ou panneau ⚙️) : notifie sur **échec**, **attente de permission**, **fin de session**, **approbation requise**.
-- **Moteur de règles** (⚙️) : « prévenir si un projet atteint N erreurs », « si un fichier contenant X est modifié ».
-- **Notifications navigateur** quand un agent attend une action.
-
-## ⌨️ Raccourcis & command palette
-
-- **Ctrl/⌘ + K** : palette de commandes — `pause <projet>`, `focus <projet>`, `search <texte>`, `night`/`day`, `light`/`dark`, `tv`, `stats`, `team`, `list`, `radar`, `replay`, `iso`, `clear`.
-- **f** plein écran (TV) · **t** équipe · **l** thème · **m** liste · **s** stats · **h** historique · **/** recherche · **z** reset zoom · **Échap** fermer.
-- **Double-clic** sur un agent → zoom caméra.
+## 🔔 Notifications Discord (configurables · ⚙️)
+Webhook Discord/Slack (persisté). Toggles par type (échec / tâche / pipeline / session / approbation / règles / sous-agent / bloqué) · **heures silencieuses** · **@ping rôle** sur erreur · **digest quotidien** · **webhook par projet** · **moteur de règles** (« N erreurs », « fichier modifié »). Sons distincts : 💥 erreur · 🎵 fin · 🔔 approbation.
 
 ## 🧰 Confort
+Vue **liste** ☰ · **plein écran / TV** 📺 · **command palette Ctrl+K** · **export MD** 📄 · **nettoyage** 🧹 (+ auto-purge) · panneau Équipe déplaçable/repliable, **groupé par projet** · **PWA installable** · responsive mobile.
+Raccourcis : `f` TV · `t` équipe · `l` thème · `m` liste · `s` stats · `h` historique · `r` rotation iso · `/` recherche · `z` recentrer · `Ctrl+K` palette · `Échap` fermer.
 
-Vue **liste compacte** (☰) · **plein écran / TV** (📺) · **export rapport Markdown** (📄) · **nettoyage** des sessions inactives (🧹, + auto-purge) · **panneau Équipe** déplaçable/repliable, **groupé par projet** · responsive mobile.
+## 💾 Persistance — SQLite (`office.db`)
+| Table | Contenu |
+|-------|---------|
+| `sessions` | 1 ligne par session (id, project, cwd, model, status, dates, host, transcriptPath, lastPrompt, summary + agents/toolCounts/toolFails/files en JSON), index `project`/`status` |
+| `journal` | tous les events (index `ts`/`session`, + diff des éditions) |
+| `kv` | réglages : feed, stats, rules, notifCfg, webhookUrl, archive |
+
+Base créée automatiquement au 1er lancement. Zéro dépendance (module intégré `node:sqlite`, Node ≥ 22).
 
 ## 🌐 Endpoints
-
 | Méthode | Chemin | Rôle |
 |---------|--------|------|
 | `POST` | `/event` | Ingestion des hooks |
-| `GET`  | `/events` | Flux SSE temps réel |
+| `GET`  | `/events` | Flux SSE |
 | `GET`  | `/api/state` | Snapshot JSON |
-| `GET`  | `/api/journal?session=&q=&limit=` | Historique (recherche) |
-| `GET`  | `/api/transcript?session=` | Conversation (prose) |
-| `GET`  | `/api/subagents?session=` | Activité réelle des sous-agents |
+| `GET`  | `/api/journal?session=&q=&limit=` | Historique (SQL) |
+| `GET`  | `/api/transcript?session=` | Conversation |
+| `GET`  | `/api/subagents?session=` | Activité des sous-agents |
 | `POST` | `/control` | pause / resume / block / approvalOn-Off |
 | `POST` | `/gate-check`, `GET /gate-decision`, `POST /approve` | Approbation (hook) |
-| `POST` | `/rules`, `/webhook`, `/prune` | Règles / webhook / nettoyage |
-| `GET`  | `/` | Le bureau virtuel |
+| `POST` | `/rules`, `/webhook`, `/notifcfg`, `/prune` | Config / nettoyage |
+| `GET`  | `/manifest.json`, `/sw.js`, `/icon.svg` | PWA |
+| `GET`  | `/` | Le bureau |
 
 ## ⚠️ Limites
-
-- L'**état est en mémoire + `office-state.json`** (persisté). Le **journal** (`office-journal.jsonl`) garde l'historique complet.
-- Les sous-agents : type / statut / durée / collaboration remontent via les hooks. Leur **activité détaillée** (outils, commandes) est reconstruite **au mieux** depuis les sidechains du transcript.
-- Le **% réel du plan Anthropic** (celui de `/usage`) n'est pas accessible hors ligne — non affiché.
+- Les sous-agents remontent via hooks (type/statut/durée/collaboration) ; leur activité détaillée est reconstruite **au mieux** depuis les sidechains du transcript.
+- Le **% réel du plan Anthropic** (`/usage`) n'est pas accessible hors ligne — non affiché.
+- L'installation **PWA** marche sur Chrome/Edge (et Firefox Android) ; Firefox desktop = onglet épinglé.
 
 ---
 

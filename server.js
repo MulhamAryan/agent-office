@@ -97,8 +97,6 @@ function notify(type, project, text, critical) {
 
 const PORT = Number(process.env.PORT) || 4519;
 const HOST = process.env.HOST || '0.0.0.0';
-const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, 'office-state.json');
-const JOURNAL_FILE = process.env.JOURNAL_FILE || path.join(__dirname, 'office-journal.jsonl');
 
 // Chemin de fichier depuis le tool_input (Read/Edit/Write/Notebook).
 function fileOf(ev, tool) {
@@ -221,7 +219,6 @@ function scheduleSave() {
   }, 1500);
 }
 function applyLoaded(data) {
-  if (Array.isArray(data.sessions)) for (const s of data.sessions) { if (s && s.id) sessions.set(s.id, s); }
   if (Array.isArray(data.feed)) { feed.push(...data.feed); if (feed.length > MAX_FEED) feed.splice(0, feed.length - MAX_FEED); }
   if (data.stats) { stats.firstStart = Math.min(stats.firstStart, data.stats.firstStart || stats.firstStart); stats.totalActions = data.stats.totalActions || 0; stats.hourly = data.stats.hourly || {}; stats.daily = data.stats.daily || {}; }
   if (Array.isArray(data.rules)) rules = data.rules;
@@ -236,32 +233,12 @@ function applyLoaded(data) {
     if (data.notifCfg.projectHooks) notifCfg.projectHooks = data.notifCfg.projectHooks;
   }
 }
-// migration unique : ancien office-state.json + office-journal.jsonl → SQLite
-function migrateFromJson() {
-  try {
-    const raw = fs.readFileSync(STATE_FILE, 'utf8'); const data = JSON.parse(raw);
-    for (const k of ['sessions', 'feed', 'stats', 'rules', 'webhookUrl', 'notifCfg', 'archive']) if (k in data) kvSet(k, data[k]);
-    console.log('migration JSON → SQLite (état)');
-  } catch { /* pas d'ancien fichier */ }
-  try {
-    const raw = fs.readFileSync(JOURNAL_FILE, 'utf8');
-    let n = 0;
-    for (const ln of raw.split('\n')) { if (!ln) continue; let e; try { e = JSON.parse(ln); } catch { continue; }
-      jInsStmt.run(e.ts || 0, e.session || '', e.project || '', e.agent || '', e.agentType || '', e.kind || '', e.tool || '', e.detail || '', e.diff ? JSON.stringify(e.diff) : null, e.ok === false ? 0 : 1); n++; }
-    if (n) console.log('migration JSONL → SQLite (' + n + ' events)');
-  } catch { /* pas d'ancien journal */ }
-}
 function loadState() {
-  const cnt = db.prepare('SELECT count(*) c FROM sessions').get().c;
-  if (!kvGet('stats') && cnt === 0) migrateFromJson();   // 1re fois : ancien JSON → kv + journal
-  // ancien blob kv['sessions'] → table normalisée (migration unique)
-  const blob = kvGet('sessions');
-  if (Array.isArray(blob)) { for (const s of blob) if (s && s.id) sessions.set(s.id, s); saveSessions(); try { kvDelStmt.run('sessions'); } catch { /* */ } }
-  else loadSessions();
+  loadSessions();
   const data = {};
   for (const k of ['feed', 'stats', 'rules', 'webhookUrl', 'notifCfg', 'archive']) data[k] = kvGet(k);
   applyLoaded(data);
-  console.log('SQLite : ' + sessions.size + ' sessions restaurées (table dédiée)');
+  console.log('SQLite : ' + sessions.size + ' sessions restaurées');
 }
 
 function projectOf(cwd) {
